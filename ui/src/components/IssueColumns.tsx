@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { Issue } from "@paperclipai/shared";
-import { Columns3 } from "lucide-react";
+import { Columns3, Pin } from "lucide-react";
 import { pickTextColorForPillBg } from "@/lib/color-contrast";
 import { Button } from "@/components/ui/button";
 import {
@@ -285,19 +285,30 @@ export function InboxIssueTrailingColumns({
           if ((issue.labels ?? []).length > 0) {
             return (
               <span key={column} className="flex min-w-0 items-center gap-1 overflow-hidden">
-                {(issue.labels ?? []).slice(0, 2).map((label) => (
-                  <span
-                    key={label.id}
-                    className="inline-flex min-w-0 max-w-full shrink-0 items-center rounded-full border px-1.5 py-0 text-[10px] font-medium"
-                    style={{
-                      borderColor: label.color,
-                      color: pickTextColorForPillBg(label.color, 0.12),
-                      backgroundColor: `${label.color}1f`,
-                    }}
-                  >
-                    <span className="truncate">{label.name}</span>
-                  </span>
-                ))}
+                {(issue.labels ?? []).slice(0, 2).map((label) => {
+                  const isPersistentChannel = label.name.startsWith("persistent-");
+                  return (
+                    <span
+                      key={label.id}
+                      className="inline-flex min-w-0 max-w-full shrink-0 items-center gap-0.5 rounded-full border px-1.5 py-0 text-[10px] font-medium"
+                      style={{
+                        borderColor: label.color,
+                        color: pickTextColorForPillBg(label.color, 0.12),
+                        backgroundColor: `${label.color}1f`,
+                      }}
+                      title={
+                        isPersistentChannel
+                          ? "Persistent channel — exempt from stranded-assigned reconcile"
+                          : undefined
+                      }
+                    >
+                      {isPersistentChannel ? (
+                        <Pin className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
+                      ) : null}
+                      <span className="truncate">{label.name}</span>
+                    </span>
+                  );
+                })}
                 {(issue.labels ?? []).length > 2 ? (
                   <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
                     +{(issue.labels ?? []).length - 2}

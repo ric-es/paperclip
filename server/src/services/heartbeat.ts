@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, like, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -92,7 +92,7 @@ const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
-const PERSISTENT_CHANNEL_LABEL_NAME = "persistent-channel";
+const PERSISTENT_CHANNEL_LABEL_PREFIX = "persistent-";
 const STRANDED_ESCALATION_DUE_MS = 4 * 60 * 60 * 1000;
 const STRANDED_ESCALATION_NEXT_MS = 24 * 60 * 60 * 1000;
 const execFile = promisify(execFileCallback);
@@ -2775,13 +2775,13 @@ export function heartbeatService(db: Db) {
 
   async function issueHasPersistentChannelLabel(issueId: string) {
     const row = await db
-      .select({ id: issueLabels.labelId })
+      .select({ name: labels.name })
       .from(issueLabels)
       .innerJoin(labels, eq(issueLabels.labelId, labels.id))
       .where(
         and(
           eq(issueLabels.issueId, issueId),
-          eq(labels.name, PERSISTENT_CHANNEL_LABEL_NAME),
+          like(labels.name, `${PERSISTENT_CHANNEL_LABEL_PREFIX}%`),
         ),
       )
       .limit(1);

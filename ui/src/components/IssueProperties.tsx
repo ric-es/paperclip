@@ -20,7 +20,7 @@ import { formatDate, cn, projectUrl } from "../lib/utils";
 import { timeAgo } from "../lib/timeAgo";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { User, Hexagon, ArrowUpRight, Tag, Plus, GitBranch, FolderOpen, Copy, Check } from "lucide-react";
+import { User, Hexagon, ArrowUpRight, Tag, Plus, GitBranch, FolderOpen, Copy, Check, Pin } from "lucide-react";
 import { AgentIcon } from "./AgentIconPicker";
 
 function TruncatedCopyable({ value, icon: Icon }: { value: string; icon: React.ComponentType<{ className?: string }> }) {
@@ -339,19 +339,30 @@ export function IssueProperties({
 
   const labelsTrigger = (issue.labels ?? []).length > 0 ? (
     <div className="flex items-center gap-1 flex-wrap">
-      {(issue.labels ?? []).slice(0, 3).map((label) => (
-        <span
-          key={label.id}
-          className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border"
-          style={{
-            borderColor: label.color,
-            backgroundColor: `${label.color}22`,
-            color: pickTextColorForPillBg(label.color, 0.13),
-          }}
-        >
-          {label.name}
-        </span>
-      ))}
+      {(issue.labels ?? []).slice(0, 3).map((label) => {
+        const isPersistentChannel = label.name.startsWith("persistent-");
+        return (
+          <span
+            key={label.id}
+            className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium border"
+            style={{
+              borderColor: label.color,
+              backgroundColor: `${label.color}22`,
+              color: pickTextColorForPillBg(label.color, 0.13),
+            }}
+            title={
+              isPersistentChannel
+                ? "Persistent channel — exempt from stranded-assigned reconcile"
+                : undefined
+            }
+          >
+            {isPersistentChannel ? (
+              <Pin className="h-3 w-3 shrink-0" aria-hidden="true" />
+            ) : null}
+            {label.name}
+          </span>
+        );
+      })}
       {(issue.labels ?? []).length > 3 && (
         <span className="text-xs text-muted-foreground">+{(issue.labels ?? []).length - 3}</span>
       )}

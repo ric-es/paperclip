@@ -13,7 +13,9 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueLabels,
   issues,
+  labels,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -646,6 +648,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("retried continuation");
+  });
+
+  it("skips stranded issues tagged with the persistent-channel label", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    const labelId = randomUUID();
+    await db.insert(labels).values({
+      id: labelId,
+      companyId,
+      name: "persistent-channel",
+      color: "#1f2937",
+    });
+    await db.insert(issueLabels).values({
+      issueId,
+      labelId,
+      companyId,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.persistentChannelSkipped).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
+  it("includes owner, due, and next-escalation SLA fields in the escalation comment", async () => {
+    const { issueId, agentId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const beforeMs = Date.now();
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    const afterMs = Date.now();
+    expect(result.escalated).toBe(1);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    const body = comments[0]?.body ?? "";
+    expect(body).toContain("**SLA (bridge contract)**");
+    expect(body).toContain(`Owner: CodexCoder (\`${agentId}\`)`);
+
+    const dueMatch = body.match(/Due: (\S+)/);
+    const nextMatch = body.match(/Next escalation: (\S+)/);
+    expect(dueMatch?.[1]).toBeTruthy();
+    expect(nextMatch?.[1]).toBeTruthy();
+
+    const dueMs = Date.parse(dueMatch![1]);
+    const nextMs = Date.parse(nextMatch![1]);
+    const fourHoursMs = 4 * 60 * 60 * 1000;
+    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
+    expect(dueMs).toBeGreaterThanOrEqual(beforeMs + fourHoursMs - 1_000);
+    expect(dueMs).toBeLessThanOrEqual(afterMs + fourHoursMs + 1_000);
+    expect(nextMs).toBeGreaterThanOrEqual(beforeMs + twentyFourHoursMs - 1_000);
+    expect(nextMs).toBeLessThanOrEqual(afterMs + twentyFourHoursMs + 1_000);
   });
 
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {

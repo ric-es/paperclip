@@ -14,7 +14,9 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueLabels,
   issues,
+  labels,
   projects,
   projectWorkspaces,
 } from "@paperclipai/db";
@@ -90,6 +92,9 @@ const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
+const PERSISTENT_CHANNEL_LABEL_NAME = "persistent-channel";
+const STRANDED_ESCALATION_DUE_MS = 4 * 60 * 60 * 1000;
+const STRANDED_ESCALATION_NEXT_MS = 24 * 60 * 60 * 1000;
 const execFile = promisify(execFileCallback);
 const ACTIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"] as const;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -2768,18 +2773,65 @@ export function heartbeatService(db: Db) {
     return queued;
   }
 
+  async function issueHasPersistentChannelLabel(issueId: string) {
+    const row = await db
+      .select({ id: issueLabels.labelId })
+      .from(issueLabels)
+      .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+      .where(
+        and(
+          eq(issueLabels.issueId, issueId),
+          eq(labels.name, PERSISTENT_CHANNEL_LABEL_NAME),
+        ),
+      )
+      .limit(1);
+    return row.length > 0;
+  }
+
+  function formatStrandedEscalationComment(input: {
+    baseComment: string;
+    owner: typeof agents.$inferSelect | null;
+    now: Date;
+  }) {
+    const ownerLabel = input.owner
+      ? `${input.owner.name} (\`${input.owner.id}\`)`
+      : "unassigned — see issue assignee";
+    const dueAt = new Date(input.now.getTime() + STRANDED_ESCALATION_DUE_MS).toISOString();
+    const nextEscalationAt = new Date(
+      input.now.getTime() + STRANDED_ESCALATION_NEXT_MS,
+    ).toISOString();
+    return [
+      input.baseComment,
+      "",
+      "**SLA (bridge contract)**",
+      `- Owner: ${ownerLabel}`,
+      `- Due: ${dueAt}`,
+      `- Next escalation: ${nextEscalationAt}`,
+    ].join("\n");
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "todo" | "in_progress";
     latestRun: typeof heartbeatRuns.$inferSelect | null;
     comment: string;
+    owner: typeof agents.$inferSelect | null;
   }) {
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
     });
     if (!updated) return null;
 
-    await issuesSvc.addComment(input.issue.id, input.comment, {});
+    const now = new Date();
+    const dueAt = new Date(now.getTime() + STRANDED_ESCALATION_DUE_MS);
+    const nextEscalationAt = new Date(now.getTime() + STRANDED_ESCALATION_NEXT_MS);
+    const commentBody = formatStrandedEscalationComment({
+      baseComment: input.comment,
+      owner: input.owner,
+      now,
+    });
+
+    await issuesSvc.addComment(input.issue.id, commentBody, {});
 
     await logActivity(db, {
       companyId: input.issue.companyId,
@@ -2798,6 +2850,9 @@ export function heartbeatService(db: Db) {
         latestRunId: input.latestRun?.id ?? null,
         latestRunStatus: input.latestRun?.status ?? null,
         latestRunErrorCode: input.latestRun?.errorCode ?? null,
+        slaOwnerAgentId: input.owner?.id ?? null,
+        slaDueAt: dueAt.toISOString(),
+        slaNextEscalationAt: nextEscalationAt.toISOString(),
       },
     });
 
@@ -2821,6 +2876,7 @@ export function heartbeatService(db: Db) {
       continuationRequeued: 0,
       escalated: 0,
       skipped: 0,
+      persistentChannelSkipped: 0,
       issueIds: [] as string[],
     };
 
@@ -2846,6 +2902,11 @@ export function heartbeatService(db: Db) {
         continue;
       }
 
+      if (await issueHasPersistentChannelLabel(issue.id)) {
+        result.persistentChannelSkipped += 1;
+        continue;
+      }
+
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
       const latestContext = parseObject(latestRun?.contextSnapshot);
       const latestRetryReason = readNonEmptyString(latestContext.retryReason);
@@ -2861,6 +2922,7 @@ export function heartbeatService(db: Db) {
             issue,
             previousStatus: "todo",
             latestRun,
+            owner: agent,
             comment:
               "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
               "but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
@@ -2896,6 +2958,7 @@ export function heartbeatService(db: Db) {
           issue,
           previousStatus: "in_progress",
           latestRun,
+          owner: agent,
           comment:
             "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
             "execution disappeared, but it still has no live execution path. Moving it to `blocked` so it is " +

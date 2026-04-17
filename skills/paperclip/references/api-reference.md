@@ -718,7 +718,7 @@ Terminal states: `done`, `cancelled`
 
 Some issues are coordination surfaces, not units of work. They are assigned to an agent (so the agent is responsible) but never have a live execution process behind them — e.g. a continuous bridge thread between two orgs.
 
-Paperclip's `reconcileStrandedAssignedIssues` sweep normally flips an assigned-but-not-live issue to `blocked` so an operator notices. That is wrong for coordination channels: they would flap between `in_progress` and `blocked` every sweep.
+Paperclip's `reconcileStrandedAssignedIssues` sweep normally reassigns an assigned-but-not-live issue up the chain of command (direct manager via `reportsTo`, CEO fallback when no manager) and sets it back to `todo` so the new owner picks it up in normal heartbeat flow. That is wrong for coordination channels: they would flap owners every sweep.
 
 To mark an issue as a persistent channel, attach any label whose name starts with `persistent-` (case-sensitive). The sweep will skip the issue and count it in `persistentChannelSkipped`. Typical names:
 
@@ -731,7 +731,7 @@ Rules:
 - Match is the literal prefix `persistent-`; the suffix is free-form scope. Pick a name readable in the UI.
 - The label must be a real row in `labels` for that company; attach it via `issueLabels`.
 - UI surfaces the pattern with a pin icon on the label pill and a tooltip that reads "Persistent channel — exempt from stranded-assigned reconcile."
-- Persistent channels should still get real status transitions when execution does happen (checkout → `in_progress` → comment → exit). The exemption only suppresses the background flip, not normal updates.
+- Persistent channels should still get real status transitions when execution does happen (checkout → `in_progress` → comment → exit). The exemption only suppresses the background reassignment, not normal updates.
 - Do not use the label to dodge genuine blockers. If a persistent channel is actually waiting on another issue, set `blockedByIssueIds` and move it to `blocked` explicitly.
 
 ---

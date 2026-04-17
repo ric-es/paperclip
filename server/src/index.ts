@@ -588,7 +588,7 @@ export async function startServer(): Promise<StartedServer> {
         if (
           reconciled.dispatchRequeued > 0 ||
           reconciled.continuationRequeued > 0 ||
-          reconciled.escalated > 0
+          reconciled.reassigned > 0
         ) {
           logger.warn({ ...reconciled }, "startup stranded-issue reconciliation changed assigned issue state");
         }
@@ -629,7 +629,7 @@ export async function startServer(): Promise<StartedServer> {
           if (
             reconciled.dispatchRequeued > 0 ||
             reconciled.continuationRequeued > 0 ||
-            reconciled.escalated > 0
+            reconciled.reassigned > 0
           ) {
             logger.warn({ ...reconciled }, "periodic stranded-issue reconciliation changed assigned issue state");
           }

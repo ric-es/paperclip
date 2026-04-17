@@ -93,8 +93,11 @@ const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const PERSISTENT_CHANNEL_LABEL_PREFIX = "persistent-";
-const STRANDED_ESCALATION_DUE_MS = 4 * 60 * 60 * 1000;
-const STRANDED_ESCALATION_NEXT_MS = 24 * 60 * 60 * 1000;
+const UNAVAILABLE_AGENT_STATUSES: ReadonlySet<string> = new Set([
+  "paused",
+  "terminated",
+  "pending_approval",
+]);
 const execFile = promisify(execFileCallback);
 const ACTIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running"] as const;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -2788,49 +2791,109 @@ export function heartbeatService(db: Db) {
     return row.length > 0;
   }
 
-  function formatStrandedEscalationComment(input: {
-    baseComment: string;
-    owner: typeof agents.$inferSelect | null;
-    now: Date;
-  }) {
-    const ownerLabel = input.owner
-      ? `${input.owner.name} (\`${input.owner.id}\`)`
-      : "unassigned — see issue assignee";
-    const dueAt = new Date(input.now.getTime() + STRANDED_ESCALATION_DUE_MS).toISOString();
-    const nextEscalationAt = new Date(
-      input.now.getTime() + STRANDED_ESCALATION_NEXT_MS,
-    ).toISOString();
-    return [
-      input.baseComment,
-      "",
-      "**SLA (bridge contract)**",
-      `- Owner: ${ownerLabel}`,
-      `- Due: ${dueAt}`,
-      `- Next escalation: ${nextEscalationAt}`,
-    ].join("\n");
+  async function resolveStrandedReassignmentTarget(input: {
+    companyId: string;
+    strandedAgent: typeof agents.$inferSelect;
+  }): Promise<{
+    target: typeof agents.$inferSelect | null;
+    source: "chain_of_command" | "ceo_fallback" | "self_top_of_chain";
+  }> {
+    const isAvailable = (candidate: typeof agents.$inferSelect | null) =>
+      Boolean(candidate && !UNAVAILABLE_AGENT_STATUSES.has(candidate.status));
+
+    if (input.strandedAgent.reportsTo) {
+      const manager = await getAgent(input.strandedAgent.reportsTo);
+      if (
+        manager &&
+        manager.companyId === input.companyId &&
+        manager.id !== input.strandedAgent.id &&
+        isAvailable(manager)
+      ) {
+        return { target: manager, source: "chain_of_command" };
+      }
+    }
+
+    const ceoCandidates = await db
+      .select()
+      .from(agents)
+      .where(and(eq(agents.companyId, input.companyId), eq(agents.role, "ceo")));
+    const rootCeo = ceoCandidates.find((c) => c.reportsTo === null && isAvailable(c));
+    const ceo = rootCeo ?? ceoCandidates.find(isAvailable) ?? null;
+    if (ceo && ceo.id !== input.strandedAgent.id) {
+      return { target: ceo, source: "ceo_fallback" };
+    }
+
+    return { target: null, source: "self_top_of_chain" };
   }
 
-  async function escalateStrandedAssignedIssue(input: {
+  function formatStrandedReassignmentComment(input: {
+    summary: string;
+    previousOwner: typeof agents.$inferSelect;
+    newOwner: typeof agents.$inferSelect | null;
+    source: "chain_of_command" | "ceo_fallback" | "self_top_of_chain";
+    latestRun: typeof heartbeatRuns.$inferSelect | null;
+  }) {
+    const previousLabel = `${input.previousOwner.name} (\`${input.previousOwner.id}\`)`;
+    const newOwnerLabel = input.newOwner
+      ? `${input.newOwner.name} (\`${input.newOwner.id}\`)`
+      : `${input.previousOwner.name} (\`${input.previousOwner.id}\`) — kept assigned, no higher link in chain of command`;
+    const routeLabel =
+      input.source === "chain_of_command"
+        ? "direct manager via `reportsTo`"
+        : input.source === "ceo_fallback"
+          ? "CEO fallback (no reachable manager in chain of command)"
+          : "no reassignment (stranded owner is already at top of chain of command)";
+
+    const lines: string[] = [
+      "**Paperclip reconcile: stranded assigned issue**",
+      "",
+      input.summary,
+      "",
+      "**Reassignment**",
+      `- Previous owner: ${previousLabel}`,
+      `- New owner: ${newOwnerLabel}`,
+      `- Route: ${routeLabel}`,
+      "- New status: `todo` — new owner will pick it up in normal heartbeat flow",
+    ];
+    if (input.latestRun) {
+      lines.push(
+        "",
+        "**Last run**",
+        `- id: \`${input.latestRun.id}\``,
+        `- status: \`${input.latestRun.status}\``,
+        `- errorCode: \`${input.latestRun.errorCode ?? "null"}\``,
+      );
+    }
+    return lines.join("\n");
+  }
+
+  async function reassignStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "todo" | "in_progress";
+    previousOwner: typeof agents.$inferSelect;
     latestRun: typeof heartbeatRuns.$inferSelect | null;
-    comment: string;
-    owner: typeof agents.$inferSelect | null;
+    summary: string;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
+    const { target, source } = await resolveStrandedReassignmentTarget({
+      companyId: input.issue.companyId,
+      strandedAgent: input.previousOwner,
     });
+
+    const patch: Parameters<typeof issuesSvc.update>[1] = { status: "todo" };
+    if (target && target.id !== input.previousOwner.id) {
+      patch.assigneeAgentId = target.id;
+    }
+
+    const updated = await issuesSvc.update(input.issue.id, patch);
     if (!updated) return null;
 
-    const now = new Date();
-    const dueAt = new Date(now.getTime() + STRANDED_ESCALATION_DUE_MS);
-    const nextEscalationAt = new Date(now.getTime() + STRANDED_ESCALATION_NEXT_MS);
-    const commentBody = formatStrandedEscalationComment({
-      baseComment: input.comment,
-      owner: input.owner,
-      now,
+    const commentBody = formatStrandedReassignmentComment({
+      summary: input.summary,
+      previousOwner: input.previousOwner,
+      newOwner: target,
+      source,
+      latestRun: input.latestRun,
     });
-
     await issuesSvc.addComment(input.issue.id, commentBody, {});
 
     await logActivity(db, {
@@ -2844,15 +2907,15 @@ export function heartbeatService(db: Db) {
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
+        status: "todo",
         previousStatus: input.previousStatus,
         source: "heartbeat.reconcile_stranded_assigned_issue",
         latestRunId: input.latestRun?.id ?? null,
         latestRunStatus: input.latestRun?.status ?? null,
         latestRunErrorCode: input.latestRun?.errorCode ?? null,
-        slaOwnerAgentId: input.owner?.id ?? null,
-        slaDueAt: dueAt.toISOString(),
-        slaNextEscalationAt: nextEscalationAt.toISOString(),
+        previousAssigneeAgentId: input.previousOwner.id,
+        newAssigneeAgentId: target?.id ?? input.previousOwner.id,
+        reassignmentSource: source,
       },
     });
 
@@ -2874,7 +2937,7 @@ export function heartbeatService(db: Db) {
     const result = {
       dispatchRequeued: 0,
       continuationRequeued: 0,
-      escalated: 0,
+      reassigned: 0,
       skipped: 0,
       persistentChannelSkipped: 0,
       issueIds: [] as string[],
@@ -2892,7 +2955,7 @@ export function heartbeatService(db: Db) {
         result.skipped += 1;
         continue;
       }
-      if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
+      if (UNAVAILABLE_AGENT_STATUSES.has(agent.status)) {
         result.skipped += 1;
         continue;
       }
@@ -2918,17 +2981,17 @@ export function heartbeatService(db: Db) {
         }
 
         if (latestRetryReason === "assignment_recovery") {
-          const updated = await escalateStrandedAssignedIssue({
+          const updated = await reassignStrandedAssignedIssue({
             issue,
             previousStatus: "todo",
+            previousOwner: agent,
             latestRun,
-            owner: agent,
-            comment:
+            summary:
               "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
-              "but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+              "but it still has no live execution path. Reassigning up the chain of command so the new owner can pick it up.",
           });
           if (updated) {
-            result.escalated += 1;
+            result.reassigned += 1;
             result.issueIds.push(issue.id);
           } else {
             result.skipped += 1;
@@ -2954,18 +3017,18 @@ export function heartbeatService(db: Db) {
       }
 
       if (latestRetryReason === "issue_continuation_needed") {
-        const updated = await escalateStrandedAssignedIssue({
+        const updated = await reassignStrandedAssignedIssue({
           issue,
           previousStatus: "in_progress",
+          previousOwner: agent,
           latestRun,
-          owner: agent,
-          comment:
+          summary:
             "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
-            "execution disappeared, but it still has no live execution path. Moving it to `blocked` so it is " +
-            "visible for intervention.",
+            "execution disappeared, but it still has no live execution path. Reassigning up the chain of command " +
+            "so the new owner can pick it up.",
         });
         if (updated) {
-          result.escalated += 1;
+          result.reassigned += 1;
           result.issueIds.push(issue.id);
         } else {
           result.skipped += 1;

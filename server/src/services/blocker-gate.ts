@@ -5,6 +5,7 @@ import { unprocessable } from "../errors.js";
 
 const PERSISTENT_CHANNEL_LABEL_PREFIX = "persistent-";
 const BLOCKER_LINE_PATTERN = /^[ \t]*BLOCKER:/im;
+export const BLOCKED_STATUS_REQUIRES_BLOCKER_CODE = "blocker_required";
 
 export interface BlockedTransitionGateInput {
   db: Db;
@@ -74,6 +75,9 @@ export async function assertBlockedTransitionAllowed(
     "Issues moving to `blocked` must declare the blocker. " +
       "Set blockedByIssueIds to at least one issue, " +
       "or include a 'BLOCKER:' line in the comment naming the external party (board, vendor, credential).",
-    { missing: "blockedByIssueIds_or_blocker_comment_line" },
+    {
+      code: BLOCKED_STATUS_REQUIRES_BLOCKER_CODE,
+      missing: "blockedByIssueIds_or_blocker_comment_line",
+    },
   );
 }

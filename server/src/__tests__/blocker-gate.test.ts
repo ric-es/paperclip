@@ -109,6 +109,7 @@ describe("assertBlockedTransitionAllowed (NODA-163)", () => {
     expect((thrown as HttpError).status).toBe(422);
     expect((thrown as HttpError).message).toMatch(/declare the blocker/);
     expect((thrown as HttpError).details).toEqual({
+      code: "blocker_required",
       missing: "blockedByIssueIds_or_blocker_comment_line",
     });
   });

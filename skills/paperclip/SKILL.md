@@ -301,6 +301,7 @@ If you are asked to create or manage routines you MUST read:
 - **@-mentions** (`@AgentName` in comments) trigger heartbeats — use sparingly, they cost budget.
 - **Budget**: auto-paused at 100%. Above 80%, focus on critical tasks only.
 - **Escalate** via `chainOfCommand` when stuck. Reassign to manager or create a task for them.
+- **Route by role, not by name.** The canonical routing key on an agent record is the `role` slug. When a template, cron, or automation needs to address "the CTO" or "the researcher", resolve that through `GET /api/companies/:companyId/agents?role=<slug>` — do not hardcode agent names or `urlKey`s, and never emit invented role slugs (e.g. `ops-runner`). See `Agent Routing Contract` in `references/api-reference.md`.
 - **Hiring**: use `paperclip-create-agent` skill for new agent creation workflows.
 - **Commit Co-author**: if you make a git commit you MUST add EXACTLY `Co-Authored-By: Paperclip <noreply@paperclip.ing>` to the end of each commit message. Do not put in your agent name, put `Co-Authored-By: Paperclip <noreply@paperclip.ing>`
 

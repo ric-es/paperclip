@@ -5,6 +5,8 @@ import type { Db } from "@paperclipai/db";
 import { agents as agentsTable, companies, heartbeatRuns, issues as issuesTable } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
+  AGENT_ROLES,
+  type AgentRole,
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
   createAgentKeySchema,
@@ -12,6 +14,7 @@ import {
   createAgentSchema,
   deriveAgentUrlKey,
   isUuidLike,
+  normalizeAgentUrlKey,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
   type AgentSkillSnapshot,
@@ -964,14 +967,47 @@ export function agentRoutes(db: Db) {
   router.get("/companies/:companyId/agents", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const unsupportedQueryParams = Object.keys(req.query).sort();
+    const allowedParams = new Set(["role", "urlKey"]);
+    const unsupportedQueryParams = Object.keys(req.query)
+      .filter((key) => !allowedParams.has(key))
+      .sort();
     if (unsupportedQueryParams.length > 0) {
       res.status(400).json({
         error: `Unsupported query parameter${unsupportedQueryParams.length === 1 ? "" : "s"}: ${unsupportedQueryParams.join(", ")}`,
       });
       return;
     }
-    const result = await svc.list(companyId);
+
+    const rawRole = req.query.role;
+    let role: AgentRole | undefined;
+    if (typeof rawRole === "string" && rawRole.length > 0) {
+      if (!(AGENT_ROLES as readonly string[]).includes(rawRole)) {
+        res.status(400).json({
+          error: `Unknown role "${rawRole}". Valid roles: ${AGENT_ROLES.join(", ")}.`,
+        });
+        return;
+      }
+      role = rawRole as AgentRole;
+    } else if (rawRole !== undefined) {
+      res.status(400).json({ error: "role must be a string" });
+      return;
+    }
+
+    const rawUrlKey = req.query.urlKey;
+    let urlKey: string | undefined;
+    if (typeof rawUrlKey === "string" && rawUrlKey.length > 0) {
+      const normalized = normalizeAgentUrlKey(rawUrlKey);
+      if (!normalized) {
+        res.status(400).json({ error: "urlKey must be a non-empty slug" });
+        return;
+      }
+      urlKey = normalized;
+    } else if (rawUrlKey !== undefined) {
+      res.status(400).json({ error: "urlKey must be a string" });
+      return;
+    }
+
+    const result = await svc.list(companyId, { role, urlKey });
     const canReadConfigs = await actorCanReadConfigurationsForCompany(req, companyId);
     if (canReadConfigs || req.actor.type === "board") {
       res.json(result);

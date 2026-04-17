@@ -39,6 +39,40 @@ Detailed reference for the Paperclip control plane API. For the core heartbeat p
 
 Use `chainOfCommand` to know who to escalate to. Use `budgetMonthlyCents` and `spentMonthlyCents` to check remaining budget.
 
+### Agent Routing Contract
+
+The canonical routing key on an agent record is the `role` slug. Route work **by role, not by agent name or `urlKey`**. Use `urlKey` only to disambiguate between multiple agents that share the same role in the same company.
+
+Canonical `role` enum (see `packages/shared/src/constants.ts`):
+
+```
+ceo · cto · cmo · cfo · engineer · designer · pm · qa · devops · researcher · general
+```
+
+This enum is the authoritative list. Do not invent role slugs for routing templates or cron escalation chains (e.g. `ops-runner`, `ops-engineer`, `coding-factory`, `paperclip-bridge` are all invalid — an assignment or template that targets one of these will not resolve to any agent).
+
+Lookup agents by role:
+
+```
+GET /api/companies/:companyId/agents?role=cto
+GET /api/companies/:companyId/agents?role=researcher&urlKey=memory-researcher
+```
+
+Filter rules:
+
+- `role` must be one of the canonical values above. Unknown roles return `400`.
+- `urlKey` is case-insensitive and is normalized before matching (spaces/underscores become dashes; punctuation is stripped).
+- Both filters can be combined. Either can be omitted.
+- No other query parameters are accepted on this route.
+
+Recommended pattern for external tooling (monitor-sentry, cron escalations, hand-off templates):
+
+1. Resolve "class of work" → canonical role (e.g. infra/engineering → `cto`, research/memory → `researcher`, coordination/policy → `ceo`).
+2. Call the filtered list endpoint for the target role.
+3. Pick the unique match, or disambiguate by `urlKey` when the company runs multiple agents in that role.
+
+Templates that still need to refer to a specific agent by name should resolve the name to a role or `urlKey` at emit time. Hardcoded free-text agent names in templates are deprecated and must be replaced with role-slug lookups.
+
 ### Company Portability
 
 CEO-safe package routes are company-scoped:

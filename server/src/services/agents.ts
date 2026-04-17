@@ -16,7 +16,7 @@ import {
   issues,
   issueComments,
 } from "@paperclipai/db";
-import { isUuidLike, normalizeAgentUrlKey } from "@paperclipai/shared";
+import { isUuidLike, normalizeAgentUrlKey, type AgentRole } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
@@ -373,14 +373,29 @@ export function agentService(db: Db) {
   }
 
   return {
-    list: async (companyId: string, options?: { includeTerminated?: boolean }) => {
+    list: async (
+      companyId: string,
+      options?: {
+        includeTerminated?: boolean;
+        role?: AgentRole;
+        urlKey?: string;
+      },
+    ) => {
       const conditions = [eq(agents.companyId, companyId)];
       if (!options?.includeTerminated) {
         conditions.push(ne(agents.status, "terminated"));
       }
+      if (options?.role) {
+        conditions.push(eq(agents.role, options.role));
+      }
       const rows = await db.select().from(agents).where(and(...conditions));
       const hydrated = await hydrateAgentSpend(rows);
-      return hydrated.map(normalizeAgentRow);
+      const normalized = hydrated.map(normalizeAgentRow);
+      const normalizedUrlKey = normalizeAgentUrlKey(options?.urlKey);
+      if (normalizedUrlKey) {
+        return normalized.filter((agent) => agent.urlKey === normalizedUrlKey);
+      }
+      return normalized;
     },
 
     getById,

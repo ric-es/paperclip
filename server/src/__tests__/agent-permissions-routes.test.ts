@@ -252,11 +252,69 @@ describe("agent permission routes", () => {
 
     const res = await request(app)
       .get(`/api/companies/${companyId}/agents`)
-      .query({ urlKey: "builder" });
+      .query({ bogus: "value" });
 
     expect(res.status).toBe(400);
-    expect(res.body.error).toContain("urlKey");
+    expect(res.body.error).toContain("bogus");
     expect(mockAgentService.list).not.toHaveBeenCalled();
+  });
+
+  it("filters the agent list by canonical role slug", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/agents`)
+      .query({ role: "cto" });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.list).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({ role: "cto" }),
+    );
+  });
+
+  it("rejects the agent list route when role is not in the canonical enum", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/agents`)
+      .query({ role: "ops-runner" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("ops-runner");
+    expect(mockAgentService.list).not.toHaveBeenCalled();
+  });
+
+  it("forwards a normalized urlKey filter to the agent list service", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/agents`)
+      .query({ urlKey: "Memory Researcher" });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.list).toHaveBeenCalledWith(
+      companyId,
+      expect.objectContaining({ urlKey: "memory-researcher" }),
+    );
   });
 
   it("normalizes direct agent creation to disable timer heartbeats by default", async () => {

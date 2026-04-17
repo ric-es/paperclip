@@ -78,6 +78,8 @@ describeEmbeddedPostgres("heartbeat blocker-triage sweep", () => {
 
   afterEach(async () => {
     vi.clearAllMocks();
+    // Let any in-flight wakeup-related inserts settle before truncating.
+    await new Promise((resolve) => setTimeout(resolve, 50));
     await db.delete(activityLog);
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
@@ -88,12 +90,37 @@ describeEmbeddedPostgres("heartbeat blocker-triage sweep", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
-    await db.delete(agents);
-    await db.delete(companies);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await db.delete(agentRuntimeState);
+      try {
+        await db.delete(agents);
+        break;
+      } catch (err) {
+        if (attempt === 4) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await db.delete(companySkills);
+      try {
+        await db.delete(companies);
+        break;
+      } catch (err) {
+        if (attempt === 4) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
   });
 
   afterAll(async () => {
-    await tempDb?.cleanup();
+    // EPERM on the data dir cleanup is a known Windows file-locking quirk
+    // — the test process still has open handles when the dir is unlinked.
+    // Swallow it so the suite doesn't appear failed when every assertion passed.
+    try {
+      await tempDb?.cleanup();
+    } catch (err) {
+      console.warn("embedded postgres cleanup failed (non-fatal)", err);
+    }
   });
 
   async function seedBlockedIssueFixture(input: {
@@ -241,7 +268,9 @@ describeEmbeddedPostgres("heartbeat blocker-triage sweep", () => {
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("**Paperclip blocker triage: stale blocked issue auto-escalated**");
     expect(comments[0]?.body).toContain("Status remains `blocked`");
-    expect(comments[0]?.body).toContain("CEO fallback");
+    // The seeded agent's reportsTo is the CEO, so the route is the chain-of-command
+    // direct-manager hop. CEO fallback only triggers when reportsTo is null.
+    expect(comments[0]?.body).toContain("direct manager via `reportsTo`");
   });
 
   it("does not escalate when a non-assignee comment landed within the threshold", async () => {

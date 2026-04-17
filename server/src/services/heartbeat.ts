@@ -94,6 +94,10 @@ const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const PERSISTENT_CHANNEL_LABEL_PREFIX = "persistent-";
 const BLOCKER_AUTO_ESCALATE_DAYS = 5;
+const PROCESS_LOSS_CIRCUIT_BREAKER_LABEL = "harness-process-loss-circuit-open";
+const PROCESS_LOSS_CIRCUIT_BREAKER_WINDOW_MS = 10 * 60 * 1000;
+const PROCESS_LOSS_CIRCUIT_BREAKER_THRESHOLD = 3;
+const PROCESS_LOSS_CIRCUIT_BREAKER_LABEL_COLOR = "#b91c1c";
 const UNAVAILABLE_AGENT_STATUSES: ReadonlySet<string> = new Set([
   "paused",
   "terminated",
@@ -2328,6 +2332,26 @@ export function heartbeatService(db: Db) {
     };
 
     const queued = await db.transaction(async (tx) => {
+      if (issueId) {
+        await tx.execute(
+          sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
+        );
+        const conflictingRun = await tx
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              inArray(heartbeatRuns.status, [...ACTIVE_HEARTBEAT_RUN_STATUSES]),
+              ne(heartbeatRuns.id, run.id),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (conflictingRun) return null;
+      }
+
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -2388,6 +2412,8 @@ export function heartbeatService(db: Db) {
 
       return retryRun;
     });
+
+    if (!queued) return null;
 
     publishLiveEvent({
       companyId: queued.companyId,
@@ -2639,28 +2665,78 @@ export function heartbeatService(db: Db) {
       if (!finalizedRun) finalizedRun = await getRun(run.id);
       if (!finalizedRun) continue;
 
+      const contextIssueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      let retrySuppressionReason:
+        | "circuit_breaker_open"
+        | "concurrent_execution_active"
+        | "breaker_label_present"
+        | null = null;
+
       if (shouldRetry) {
         const agent = await getAgent(run.agentId);
         if (agent) {
-          retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
+          if (contextIssueId) {
+            if (await issueHasProcessLossCircuitLabel(contextIssueId)) {
+              retrySuppressionReason = "breaker_label_present";
+            } else {
+              const windowStart = new Date(
+                now.getTime() - PROCESS_LOSS_CIRCUIT_BREAKER_WINDOW_MS,
+              );
+              const recentProcessLossCount = await countRecentProcessLossRunsForIssue(
+                finalizedRun.companyId,
+                contextIssueId,
+                windowStart,
+              );
+              if (recentProcessLossCount >= PROCESS_LOSS_CIRCUIT_BREAKER_THRESHOLD) {
+                await openProcessLossCircuitBreaker({
+                  run: finalizedRun,
+                  issueId: contextIssueId,
+                  recentCount: recentProcessLossCount,
+                });
+                retrySuppressionReason = "circuit_breaker_open";
+              } else if (await hasActiveExecutionPath(finalizedRun.companyId, contextIssueId)) {
+                retrySuppressionReason = "concurrent_execution_active";
+              }
+            }
+          }
+
+          if (!retrySuppressionReason) {
+            retriedRun = await enqueueProcessLossRetry(finalizedRun, agent, now);
+            if (!retriedRun) {
+              retrySuppressionReason = "concurrent_execution_active";
+            }
+          }
         }
-      } else {
+      }
+
+      if (!retriedRun) {
         await releaseIssueExecutionAndPromote(finalizedRun);
       }
+
+      const lifecycleMessage = !shouldRetry
+        ? baseMessage
+        : retriedRun
+          ? `${baseMessage}; queued retry ${retriedRun.id}`.trim()
+          : retrySuppressionReason === "circuit_breaker_open"
+            ? `${baseMessage}; retry suppressed — process-loss circuit breaker tripped`
+            : retrySuppressionReason === "breaker_label_present"
+              ? `${baseMessage}; retry suppressed — process-loss circuit breaker label already set`
+              : retrySuppressionReason === "concurrent_execution_active"
+                ? `${baseMessage}; retry suppressed — another execution is already active for this issue`
+                : baseMessage;
 
       await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "error",
-        message: shouldRetry
-          ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
-          : baseMessage,
+        message: lifecycleMessage,
         payload: {
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+          ...(retrySuppressionReason ? { retrySuppressionReason } : {}),
         },
       });
 
@@ -2790,6 +2866,123 @@ export function heartbeatService(db: Db) {
       )
       .limit(1);
     return row.length > 0;
+  }
+
+  async function issueHasProcessLossCircuitLabel(issueId: string) {
+    const row = await db
+      .select({ id: issueLabels.labelId })
+      .from(issueLabels)
+      .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+      .where(
+        and(
+          eq(issueLabels.issueId, issueId),
+          eq(labels.name, PROCESS_LOSS_CIRCUIT_BREAKER_LABEL),
+        ),
+      )
+      .limit(1);
+    return row.length > 0;
+  }
+
+  async function countRecentProcessLossRunsForIssue(
+    companyId: string,
+    issueId: string,
+    since: Date,
+  ) {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.errorCode, "process_lost"),
+          gt(heartbeatRuns.updatedAt, since),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      );
+    return Number(count ?? 0);
+  }
+
+  async function ensureProcessLossCircuitBreakerLabelId(companyId: string) {
+    const existing = await db
+      .select({ id: labels.id })
+      .from(labels)
+      .where(
+        and(
+          eq(labels.companyId, companyId),
+          eq(labels.name, PROCESS_LOSS_CIRCUIT_BREAKER_LABEL),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existing) return existing.id;
+    const inserted = await db
+      .insert(labels)
+      .values({
+        companyId,
+        name: PROCESS_LOSS_CIRCUIT_BREAKER_LABEL,
+        color: PROCESS_LOSS_CIRCUIT_BREAKER_LABEL_COLOR,
+      })
+      .returning({ id: labels.id })
+      .then((rows) => rows[0]);
+    return inserted.id;
+  }
+
+  async function openProcessLossCircuitBreaker(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string;
+    recentCount: number;
+  }) {
+    const { run, issueId, recentCount } = input;
+    const labelId = await ensureProcessLossCircuitBreakerLabelId(run.companyId);
+
+    const alreadyAttached = await db
+      .select({ labelId: issueLabels.labelId })
+      .from(issueLabels)
+      .where(and(eq(issueLabels.issueId, issueId), eq(issueLabels.labelId, labelId)))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!alreadyAttached) {
+      await db.insert(issueLabels).values({
+        companyId: run.companyId,
+        issueId,
+        labelId,
+      });
+    }
+
+    const windowMin = Math.round(PROCESS_LOSS_CIRCUIT_BREAKER_WINDOW_MS / 60_000);
+    const body = [
+      "**Paperclip harness: process-loss circuit breaker tripped**",
+      "",
+      `Detected ${recentCount} \`process_lost\` run(s) for this issue within the last ${windowMin} minutes (threshold ${PROCESS_LOSS_CIRCUIT_BREAKER_THRESHOLD}).`,
+      `Auto-retry is suppressed and the issue is flagged \`${PROCESS_LOSS_CIRCUIT_BREAKER_LABEL}\` for manual review — further retries will be blocked while this label is attached.`,
+      "",
+      "Child processes keep dying before completing work. Likely root causes:",
+      "- host-level instability (OOM, filesystem lock, adapter crash on start)",
+      "- corrupted workspace state from a previous crash",
+      "- adapter config or credential drift",
+      "",
+      "Clear the label once the underlying issue is resolved to resume automated retries.",
+    ].join("\n");
+
+    await issuesSvc.addComment(issueId, body, {});
+
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: run.id,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: {
+        source: "heartbeat.process_loss_circuit_breaker",
+        recentProcessLossCount: recentCount,
+        windowMs: PROCESS_LOSS_CIRCUIT_BREAKER_WINDOW_MS,
+        threshold: PROCESS_LOSS_CIRCUIT_BREAKER_THRESHOLD,
+        labelApplied: PROCESS_LOSS_CIRCUIT_BREAKER_LABEL,
+      },
+    });
   }
 
   async function resolveStrandedReassignmentTarget(input: {

@@ -555,6 +555,175 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.checkoutRunId).toBe(runId);
   });
 
+  it("does not spawn a retry when another run is already active on the same issue", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      processPid: 999_999_999,
+    });
+
+    // Pre-seed a second active run for the same issue — simulates a concurrent
+    // execution path (e.g. stranded reconcile already requeued work).
+    const activeRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: activeRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: { issueId },
+      processLossRetryCount: 0,
+      startedAt: new Date("2026-03-19T00:00:05.000Z"),
+      updatedAt: new Date("2026-03-19T00:00:05.000Z"),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    // Original failed run + the pre-seeded queued run. No retry inserted.
+    expect(runs).toHaveLength(2);
+    expect(runs.map((r) => r.id).sort()).toEqual([runId, activeRunId].sort());
+
+    const originalRun = runs.find((r) => r.id === runId);
+    expect(originalRun?.status).toBe("failed");
+    expect(originalRun?.errorCode).toBe("process_lost");
+  });
+
+  it("trips the process-loss circuit breaker after N failures in the window and stops retrying", async () => {
+    const { companyId, agentId, issueId, runId: firstRunId } = await seedRunFixture({
+      processPid: 999_999_999,
+    });
+
+    // Seed two prior process_lost failures inside the circuit breaker window so
+    // that this failing run is the 3rd within 10 minutes.
+    const now = new Date("2026-03-19T00:00:00.000Z");
+    for (let i = 0; i < 2; i += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: { issueId },
+        errorCode: "process_lost",
+        processLossRetryCount: 1,
+        startedAt: new Date(now.getTime() - (i + 1) * 60_000),
+        finishedAt: new Date(now.getTime() - (i + 1) * 60_000 + 1_000),
+        updatedAt: new Date(now.getTime() - (i + 1) * 60_000 + 1_000),
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    // No new retry run inserted: 3 failed process_lost + the original (now failed) = 3 visible.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .then((rows) => rows.sort((a, b) => (a.createdAt?.getTime() ?? 0) - (b.createdAt?.getTime() ?? 0)));
+    expect(runs).toHaveLength(3);
+    expect(runs.every((r) => r.status === "failed")).toBe(true);
+
+    // Circuit breaker label attached to the issue.
+    const attachedLabels = await db
+      .select({ name: labels.name })
+      .from(issueLabels)
+      .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+      .where(eq(issueLabels.issueId, issueId));
+    expect(attachedLabels.map((l) => l.name)).toContain("harness-process-loss-circuit-open");
+
+    // Breaker comment posted.
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments.some((c) => c.body.includes("process-loss circuit breaker tripped"))).toBe(true);
+
+    // Execution lock released for human review.
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBe(firstRunId);
+  });
+
+  it("does not trip the circuit breaker for process_lost runs outside the window", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      processPid: 999_999_999,
+    });
+
+    // Two prior process_lost failures, but both older than 10 minutes.
+    const now = new Date("2026-03-19T00:00:00.000Z");
+    for (let i = 0; i < 2; i += 1) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: { issueId },
+        errorCode: "process_lost",
+        processLossRetryCount: 1,
+        startedAt: new Date(now.getTime() - (20 + i) * 60_000),
+        finishedAt: new Date(now.getTime() - (20 + i) * 60_000 + 1_000),
+        updatedAt: new Date(now.getTime() - (20 + i) * 60_000 + 1_000),
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reapOrphanedRuns();
+
+    // Breaker should NOT trip — retry should have been queued.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = runs.find((r) => r.retryOfRunId === runId);
+    expect(retryRun).toBeTruthy();
+    expect(retryRun?.status).toBe("queued");
+
+    const attachedLabels = await db
+      .select({ name: labels.name })
+      .from(issueLabels)
+      .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+      .where(eq(issueLabels.issueId, issueId));
+    expect(attachedLabels.map((l) => l.name)).not.toContain("harness-process-loss-circuit-open");
+  });
+
+  it("suppresses future retries once the circuit breaker label is already attached", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      processPid: 999_999_999,
+    });
+
+    // Pre-attach the circuit breaker label to simulate a human-acknowledged breaker.
+    const labelId = randomUUID();
+    await db.insert(labels).values({
+      id: labelId,
+      companyId,
+      name: "harness-process-loss-circuit-open",
+      color: "#b91c1c",
+    });
+    await db.insert(issueLabels).values({ companyId, issueId, labelId });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reapOrphanedRuns();
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    // Only the original failed run — no retry queued.
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.id).toBe(runId);
+    expect(runs[0]?.status).toBe("failed");
+  });
+
   it("clears the detached warning when the run reports activity again", async () => {
     const { runId } = await seedRunFixture({
       includeIssue: false,

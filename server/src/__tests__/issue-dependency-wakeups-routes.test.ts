@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDeduplicateChildrenCompletedWake = vi.hoisted(() => vi.fn(async () => false));
 const mockIssueService = vi.hoisted(() => ({
   getAncestors: vi.fn(),
   getById: vi.fn(),
@@ -37,6 +38,7 @@ vi.mock("../services/index.js", () => ({
   }),
   heartbeatService: () => ({
     wakeup: mockWakeup,
+    deduplicateChildrenCompletedWake: mockDeduplicateChildrenCompletedWake,
     reportRunActivity: vi.fn(async () => undefined),
   }),
   instanceSettingsService: () => ({
@@ -97,6 +99,8 @@ describe("issue dependency wakeups in issue routes", () => {
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockDeduplicateChildrenCompletedWake.mockReset();
+    mockDeduplicateChildrenCompletedWake.mockResolvedValue(false);
   });
 
   it("wakes dependents when the final blocker transitions to done", async () => {
@@ -213,5 +217,69 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       );
     });
+    expect(mockDeduplicateChildrenCompletedWake).toHaveBeenCalledWith({
+      companyId: "company-1",
+      agentId: "agent-9",
+      parentIssueId: "parent-1",
+      childIssueIds: ["child-0", "child-1"],
+    });
+  });
+
+  it("suppresses the children-completed wake when the dedup helper returns true", async () => {
+    mockIssueService.getById.mockResolvedValue({
+      id: "child-1",
+      companyId: "company-1",
+      identifier: "PAP-101",
+      title: "Last child",
+      description: null,
+      status: "in_progress",
+      priority: "medium",
+      parentId: "parent-1",
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.update.mockResolvedValue({
+      id: "child-1",
+      companyId: "company-1",
+      identifier: "PAP-101",
+      title: "Last child",
+      description: null,
+      status: "done",
+      priority: "medium",
+      parentId: "parent-1",
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    });
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue({
+      id: "parent-1",
+      assigneeAgentId: "agent-9",
+      childIssueIds: ["child-0", "child-1"],
+    });
+    mockDeduplicateChildrenCompletedWake.mockResolvedValue(true);
+
+    const res = await request(await createApp()).patch("/api/issues/child-1").send({ status: "done" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockDeduplicateChildrenCompletedWake).toHaveBeenCalledWith({
+        companyId: "company-1",
+        agentId: "agent-9",
+        parentIssueId: "parent-1",
+        childIssueIds: ["child-0", "child-1"],
+      });
+    });
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ reason: "issue_children_completed" }),
+    );
   });
 });

@@ -98,6 +98,8 @@ const PROCESS_LOSS_CIRCUIT_BREAKER_LABEL = "harness-process-loss-circuit-open";
 const PROCESS_LOSS_CIRCUIT_BREAKER_WINDOW_MS = 10 * 60 * 1000;
 const PROCESS_LOSS_CIRCUIT_BREAKER_THRESHOLD = 3;
 const PROCESS_LOSS_CIRCUIT_BREAKER_LABEL_COLOR = "#b91c1c";
+const CHILDREN_COMPLETED_DEDUP_WINDOW_MS = 60 * 60 * 1000;
+const CHILDREN_COMPLETED_DEDUP_REASON = "issue_children_completed_dedup";
 const UNAVAILABLE_AGENT_STATUSES: ReadonlySet<string> = new Set([
   "paused",
   "terminated",
@@ -4751,6 +4753,74 @@ export function heartbeatService(db: Db) {
     await startNextQueuedRunForAgent(promotedRun.agentId);
   }
 
+  async function deduplicateChildrenCompletedWake(opts: {
+    companyId: string;
+    agentId: string;
+    parentIssueId: string;
+    childIssueIds: string[];
+    windowMs?: number;
+  }): Promise<boolean> {
+    const windowMs = opts.windowMs ?? CHILDREN_COMPLETED_DEDUP_WINDOW_MS;
+    const cutoff = new Date(Date.now() - windowMs);
+    const sortedIncoming = Array.from(new Set(opts.childIssueIds)).sort();
+
+    const recent = await db
+      .select({
+        id: agentWakeupRequests.id,
+        payload: agentWakeupRequests.payload,
+        requestedAt: agentWakeupRequests.requestedAt,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, opts.companyId),
+          eq(agentWakeupRequests.agentId, opts.agentId),
+          eq(agentWakeupRequests.reason, "issue_children_completed"),
+          gt(agentWakeupRequests.requestedAt, cutoff),
+          sql`${agentWakeupRequests.payload} ->> 'issueId' = ${opts.parentIssueId}`,
+          ne(agentWakeupRequests.status, "skipped"),
+        ),
+      )
+      .orderBy(desc(agentWakeupRequests.requestedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    if (!recent) return false;
+
+    const recentPayload = parseObject(recent.payload);
+    const rawIds = Array.isArray(recentPayload.childIssueIds)
+      ? recentPayload.childIssueIds.filter((value): value is string => typeof value === "string")
+      : [];
+    const sortedRecent = Array.from(new Set(rawIds)).sort();
+    if (
+      sortedRecent.length !== sortedIncoming.length ||
+      sortedRecent.some((id, idx) => id !== sortedIncoming[idx])
+    ) {
+      return false;
+    }
+
+    await db.insert(agentWakeupRequests).values({
+      companyId: opts.companyId,
+      agentId: opts.agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: CHILDREN_COMPLETED_DEDUP_REASON,
+      payload: {
+        issueId: opts.parentIssueId,
+        childIssueIds: sortedIncoming,
+        previousWakeRequestId: recent.id,
+        previousWakeRequestedAt: recent.requestedAt.toISOString(),
+        windowMs,
+      },
+      status: "skipped",
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      finishedAt: new Date(),
+    });
+
+    return true;
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -5582,6 +5652,8 @@ export function heartbeatService(db: Db) {
       }),
 
     wakeup: enqueueWakeup,
+
+    deduplicateChildrenCompletedWake,
 
     reportRunActivity: clearDetachedRunWarning,
 

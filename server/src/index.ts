@@ -36,6 +36,7 @@ import {
   routineService,
 } from "./services/index.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import { ptDateString, shouldRunBlockerTriageSweep } from "./services/blocker-triage-time.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -577,7 +578,8 @@ export async function startServer(): Promise<StartedServer> {
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any);
     const routines = routineService(db as any);
-  
+    let lastBlockerTriageSweepDate: string | null = null;
+
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
     void heartbeat
@@ -637,6 +639,22 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "periodic heartbeat recovery failed");
         });
+
+      const tickNow = new Date();
+      if (shouldRunBlockerTriageSweep(tickNow, lastBlockerTriageSweepDate)) {
+        const ptDate = ptDateString(tickNow);
+        lastBlockerTriageSweepDate = ptDate;
+        void heartbeat
+          .runBlockerTriageSweep(tickNow)
+          .then((sweep) => {
+            if (sweep.escalated > 0 || sweep.digestsPosted > 0) {
+              logger.info({ ...sweep, ptDate }, "blocker triage sweep ran");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err, ptDate }, "blocker triage sweep failed");
+          });
+      }
     }, config.heartbeatSchedulerIntervalMs);
   }
   

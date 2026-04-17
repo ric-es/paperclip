@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, isNull, like, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, like, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -93,6 +93,7 @@ const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const PERSISTENT_CHANNEL_LABEL_PREFIX = "persistent-";
+const BLOCKER_AUTO_ESCALATE_DAYS = 5;
 const UNAVAILABLE_AGENT_STATUSES: ReadonlySet<string> = new Set([
   "paused",
   "terminated",
@@ -3055,6 +3056,199 @@ export function heartbeatService(db: Db) {
     return result;
   }
 
+  async function runBlockerTriageSweep(now: Date = new Date()) {
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          isNull(issues.assigneeUserId),
+          sql`${issues.assigneeAgentId} is not null`,
+        ),
+      );
+
+    const result = {
+      checked: 0,
+      escalated: 0,
+      digestsPosted: 0,
+      persistentChannelSkipped: 0,
+      escalatedIssueIds: [] as string[],
+      digestsByAgentId: {} as Record<
+        string,
+        {
+          companyId: string;
+          assigneeAgentId: string;
+          issueIds: string[];
+          oldestStaleDays: number;
+        }
+      >,
+    };
+
+    const cutoffMs = now.getTime() - BLOCKER_AUTO_ESCALATE_DAYS * 24 * 60 * 60 * 1000;
+
+    for (const issue of candidates) {
+      const agentId = issue.assigneeAgentId;
+      if (!agentId) continue;
+      result.checked += 1;
+
+      const agent = await getAgent(agentId);
+      if (!agent || agent.companyId !== issue.companyId) continue;
+
+      if (await issueHasPersistentChannelLabel(issue.id)) {
+        result.persistentChannelSkipped += 1;
+        continue;
+      }
+
+      const lastNonAssigneeCommentAt = await getLastNonAssigneeCommentAt(issue.id, agentId);
+      const lastActivityAt =
+        lastNonAssigneeCommentAt ?? issue.startedAt ?? issue.updatedAt ?? issue.createdAt;
+      const lastActivityMs = lastActivityAt instanceof Date ? lastActivityAt.getTime() : new Date(lastActivityAt).getTime();
+      const ageDays = Math.floor((now.getTime() - lastActivityMs) / (24 * 60 * 60 * 1000));
+
+      const digestEntry = result.digestsByAgentId[agentId] ?? {
+        companyId: issue.companyId,
+        assigneeAgentId: agentId,
+        issueIds: [] as string[],
+        oldestStaleDays: 0,
+      };
+      digestEntry.issueIds.push(issue.id);
+      digestEntry.oldestStaleDays = Math.max(digestEntry.oldestStaleDays, ageDays);
+      result.digestsByAgentId[agentId] = digestEntry;
+
+      if (lastActivityMs <= cutoffMs) {
+        const escalated = await escalateStaleBlockedIssue({
+          issue,
+          previousOwner: agent,
+          ageDays,
+          lastActivityAt: lastActivityAt instanceof Date ? lastActivityAt : new Date(lastActivityAt),
+        });
+        if (escalated) {
+          result.escalated += 1;
+          result.escalatedIssueIds.push(issue.id);
+        }
+      }
+    }
+
+    for (const entry of Object.values(result.digestsByAgentId)) {
+      const wakeup = await enqueueWakeup(entry.assigneeAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "blocker_triage_digest",
+        payload: {
+          blockedIssueIds: entry.issueIds,
+          oldestStaleDays: entry.oldestStaleDays,
+        },
+        requestedByActorType: "system",
+        requestedByActorId: "blocker_triage_sweep",
+        contextSnapshot: {
+          source: "blocker_triage_sweep",
+          reason: "daily_digest",
+          blockedIssueCount: entry.issueIds.length,
+          oldestStaleDays: entry.oldestStaleDays,
+          now: now.toISOString(),
+        },
+      }).catch((err) => {
+        logger.warn(
+          { err, agentId: entry.assigneeAgentId },
+          "blocker triage digest wakeup failed",
+        );
+        return null;
+      });
+      if (wakeup) result.digestsPosted += 1;
+    }
+
+    return result;
+  }
+
+  async function getLastNonAssigneeCommentAt(issueId: string, assigneeAgentId: string) {
+    const row = await db
+      .select({ createdAt: issueComments.createdAt })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, issueId),
+          or(
+            sql`${issueComments.authorUserId} is not null`,
+            and(
+              sql`${issueComments.authorAgentId} is not null`,
+              ne(issueComments.authorAgentId, assigneeAgentId),
+            ),
+          ),
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt))
+      .limit(1);
+    return row[0]?.createdAt ?? null;
+  }
+
+  async function escalateStaleBlockedIssue(input: {
+    issue: typeof issues.$inferSelect;
+    previousOwner: typeof agents.$inferSelect;
+    ageDays: number;
+    lastActivityAt: Date;
+  }) {
+    const { target, source } = await resolveStrandedReassignmentTarget({
+      companyId: input.issue.companyId,
+      strandedAgent: input.previousOwner,
+    });
+
+    if (!target || target.id === input.previousOwner.id) {
+      return null;
+    }
+
+    const updated = await issuesSvc.update(input.issue.id, {
+      assigneeAgentId: target.id,
+    });
+    if (!updated) return null;
+
+    const previousLabel = `${input.previousOwner.name} (\`${input.previousOwner.id}\`)`;
+    const newOwnerLabel = `${target.name} (\`${target.id}\`)`;
+    const routeLabel =
+      source === "chain_of_command"
+        ? "direct manager via `reportsTo`"
+        : "CEO fallback (no reachable manager in chain of command)";
+
+    const commentBody = [
+      "**Paperclip blocker triage: stale blocked issue auto-escalated**",
+      "",
+      `This issue has been \`blocked\` with no comment from a non-blocking party for ${input.ageDays} day${input.ageDays === 1 ? "" : "s"} ` +
+        `(threshold: ${BLOCKER_AUTO_ESCALATE_DAYS} days). Reassigning up the chain of command. ` +
+        "Status remains `blocked` — clearing it requires the new owner to address the underlying blocker.",
+      "",
+      "**Reassignment**",
+      `- Previous owner: ${previousLabel}`,
+      `- New owner: ${newOwnerLabel}`,
+      `- Route: ${routeLabel}`,
+      `- Last non-blocking activity: \`${input.lastActivityAt.toISOString()}\``,
+    ].join("\n");
+    await issuesSvc.addComment(input.issue.id, commentBody, {});
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: "blocked",
+        previousAssigneeAgentId: input.previousOwner.id,
+        newAssigneeAgentId: target.id,
+        source: "heartbeat.blocker_triage_escalate",
+        reassignmentSource: source,
+        ageDays: input.ageDays,
+        thresholdDays: BLOCKER_AUTO_ESCALATE_DAYS,
+        lastActivityAt: input.lastActivityAt.toISOString(),
+      },
+    });
+
+    return updated;
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -5203,6 +5397,8 @@ export function heartbeatService(db: Db) {
     resumeQueuedRuns,
 
     reconcileStrandedAssignedIssues,
+
+    runBlockerTriageSweep,
 
     tickTimers: async (now = new Date()) => {
       const allAgents = await db.select().from(agents);

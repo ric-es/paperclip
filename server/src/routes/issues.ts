@@ -56,6 +56,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import { assertBlockedTransitionAllowed } from "../services/blocker-gate.js";
 import {
   applyIssueExecutionPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -1327,6 +1328,17 @@ export function issueRoutes(
       await assertCanAssignTasks(req, companyId);
     }
 
+    await assertBlockedTransitionAllowed({
+      db,
+      previousStatus: null,
+      nextStatus: typeof req.body.status === "string" ? req.body.status : undefined,
+      comment: null,
+      blockedByIssueIds: Array.isArray(req.body.blockedByIssueIds) ? req.body.blockedByIssueIds : undefined,
+      existingBlockedByIssueIds: [],
+      description: typeof req.body.description === "string" ? req.body.description : null,
+      issueId: null,
+    });
+
     const actor = getActorInfo(req);
     const executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
     const issue = await svc.create(companyId, {
@@ -1447,6 +1459,24 @@ export function issueRoutes(
     }
     if (commentBody && effectiveReopenRequested && isClosed && updateFields.status === undefined) {
       updateFields.status = "todo";
+    }
+    if (updateFields.status === "blocked" && existing.status !== "blocked") {
+      const requestedBlockers = Array.isArray(req.body.blockedByIssueIds)
+        ? (req.body.blockedByIssueIds as string[])
+        : undefined;
+      const existingRelationsForGate =
+        existingRelations ?? (requestedBlockers === undefined ? await svc.getRelationSummaries(existing.id) : null);
+      await assertBlockedTransitionAllowed({
+        db,
+        previousStatus: existing.status,
+        nextStatus: "blocked",
+        comment: typeof commentBody === "string" ? commentBody : null,
+        blockedByIssueIds: requestedBlockers,
+        existingBlockedByIssueIds:
+          existingRelationsForGate?.blockedBy.map((relation) => relation.id) ?? [],
+        description: typeof req.body.description === "string" ? req.body.description : existing.description,
+        issueId: existing.id,
+      });
     }
     if (req.body.executionPolicy !== undefined) {
       updateFields.executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);

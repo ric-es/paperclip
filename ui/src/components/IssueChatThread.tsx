@@ -1485,7 +1485,7 @@ function IssueChatSystemMessage() {
     : null;
 
   if (custom.kind === "event" && actorName) {
-    const isCurrentUser = actorType === "user" && !!currentUserId && actorId === currentUserId;
+    const isCurrentUser = actorType === "user" && !!currentUserId && currentUserId !== "local-board" && actorId === currentUserId;
     const isAgent = actorType === "agent";
     const agentIcon = isAgent && actorId ? agentMap?.get(actorId)?.icon : undefined;
 

@@ -296,6 +296,7 @@ function CommentCard({
   voting = false,
   highlightCommentId,
   queued = false,
+  currentUserId,
 }: {
   comment: CommentWithRunMeta;
   agentMap?: Map<string, Agent>;
@@ -311,6 +312,7 @@ function CommentCard({
   voting?: boolean;
   highlightCommentId?: string | null;
   queued?: boolean;
+  currentUserId?: string | null;
 }) {
   const isHighlighted = highlightCommentId === comment.id;
   const isPending = comment.clientStatus === "pending";
@@ -337,7 +339,7 @@ function CommentCard({
             />
           </Link>
         ) : (
-          <Identity name="You" size="sm" />
+          <Identity name={formatAssigneeUserLabel(comment.authorUserId, currentUserId) ?? "Board"} size="sm" />
         )}
         <span className="flex items-center gap-1.5">
           {isQueued ? (
@@ -629,6 +631,7 @@ const TimelineList = memo(function TimelineList({
             onVote={onVote ? (vote, options) => onVote(comment.id, vote, options) : undefined}
             voting={votingTargetId === comment.id}
             highlightCommentId={highlightCommentId}
+            currentUserId={currentUserId}
           />
         );
       })}
@@ -899,6 +902,7 @@ export function CommentThread({
                 companyId={companyId}
                 projectId={projectId}
                 highlightCommentId={highlightCommentId}
+                currentUserId={currentUserId}
                 queued
               />
             ))}

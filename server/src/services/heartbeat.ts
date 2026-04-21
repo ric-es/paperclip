@@ -3206,6 +3206,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function finalizeIssueCommentPolicy(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
+    opts?: { skipMissingIssueCommentRetry?: boolean },
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
@@ -3228,6 +3229,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueCommentRetryQueuedAt: null,
       });
       return { outcome: "satisfied" as const, queuedRun: null };
+    }
+
+    if (opts?.skipMissingIssueCommentRetry) {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
     if (readNonEmptyString(contextSnapshot.retryReason) === "missing_issue_comment") {
@@ -4498,8 +4510,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function reconcileStrandedAssignedIssues() {
-    return recovery.reconcileStrandedAssignedIssues();
+  async function reconcileStrandedAssignedIssues(opts?: { issueIds?: string[] }) {
+    return recovery.reconcileStrandedAssignedIssues(opts);
   }
 
   function issueIdFromRunContext(contextSnapshot: unknown) {
@@ -5710,6 +5722,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
+        let timedOutRecovery: Awaited<ReturnType<typeof reconcileStrandedAssignedIssues>> | null = null;
+        if (issueId && outcome === "timed_out") {
+          timedOutRecovery = await reconcileStrandedAssignedIssues({ issueIds: [issueId] });
+          if (
+            timedOutRecovery.dispatchRequeued > 0 ||
+            timedOutRecovery.continuationRequeued > 0 ||
+            timedOutRecovery.escalated > 0
+          ) {
+            await appendRunEvent(finalizedRun, seq++, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: timedOutRecovery.escalated > 0 ? "warn" : "info",
+              message:
+                timedOutRecovery.escalated > 0
+                  ? "automatic issue timeout recovery was exhausted; issue moved to blocked"
+                  : "queued automatic issue recovery after timeout",
+              payload: {
+                issueId,
+                dispatchRequeued: timedOutRecovery.dispatchRequeued,
+                continuationRequeued: timedOutRecovery.continuationRequeued,
+                escalated: timedOutRecovery.escalated,
+              },
+            });
+          }
+        }
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
@@ -5741,7 +5778,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
-        await finalizeIssueCommentPolicy(livenessRun, agent);
+        await finalizeIssueCommentPolicy(livenessRun, agent, {
+          skipMissingIssueCommentRetry: Boolean(timedOutRecovery?.issueIds.includes(issueId ?? "")),
+        });
         await releaseIssueExecutionAndPromote(livenessRun);
         await handleRunLivenessContinuation(livenessRun);
       }

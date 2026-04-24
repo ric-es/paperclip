@@ -1,6 +1,5 @@
 import { z } from "zod";
 import {
-  addIssueCommentSchema,
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
   createApprovalSchema,
@@ -19,10 +18,12 @@ export interface ToolDefinition {
   name: string;
   description: string;
   schema: z.AnyZodObject;
-  execute: (input: Record<string, unknown>) => Promise<{
+  execute: (input: { [key: string]: unknown }) => Promise<{
     content: Array<{ type: "text"; text: string }>;
   }>;
 }
+
+type JsonMap = { [key: string]: unknown };
 
 function makeTool<TSchema extends z.ZodRawShape>(
   name: string,
@@ -109,7 +110,12 @@ const checkoutIssueToolSchema = z.object({
 
 const addCommentToolSchema = z.object({
   issueId: issueIdSchema,
-}).merge(addIssueCommentSchema);
+  body: z.string().min(1).optional(),
+  content: z.string().min(1).optional(),
+  comment: z.string().min(1).optional(),
+  reopen: z.boolean().optional(),
+  interrupt: z.boolean().optional(),
+});
 
 const createSuggestTasksToolSchema = z.object({
   issueId: issueIdSchema,
@@ -183,21 +189,21 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function readCurrentExecutionWorkspace(context: unknown): Record<string, unknown> | null {
+function readCurrentExecutionWorkspace(context: unknown): JsonMap | null {
   if (!context || typeof context !== "object") return null;
   const workspace = (context as { currentExecutionWorkspace?: unknown }).currentExecutionWorkspace;
-  return workspace && typeof workspace === "object" ? workspace as Record<string, unknown> : null;
+  return workspace && typeof workspace === "object" ? workspace as JsonMap : null;
 }
 
-function readWorkspaceRuntimeServices(workspace: Record<string, unknown> | null): Array<Record<string, unknown>> {
+function readWorkspaceRuntimeServices(workspace: JsonMap | null): JsonMap[] {
   const raw = workspace?.runtimeServices;
   return Array.isArray(raw)
-    ? raw.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+    ? raw.filter((entry): entry is JsonMap => Boolean(entry) && typeof entry === "object")
     : [];
 }
 
 function selectRuntimeService(
-  services: Array<Record<string, unknown>>,
+  services: JsonMap[],
   input: { runtimeServiceId?: string | null; serviceName?: string | null },
 ) {
   if (input.runtimeServiceId) {

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, agents, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { agentApiKeys, agents, companyMemberships, heartbeatRuns, instanceUserRoles } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
@@ -85,7 +85,74 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           return;
         }
       }
-      if (runIdHeader) req.actor.runId = runIdHeader;
+      if (runIdHeader) {
+        // In local_trusted mode the default actor is the implicit board admin.
+        // Agents running locally sometimes reach the API with only an
+        // x-paperclip-run-id header (no bearer JWT); without this resolution,
+        // their writes would be attributed to "local-board" instead of the agent.
+        if (opts.deploymentMode === "local_trusted") {
+          const run = await db
+            .select({ agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, runIdHeader))
+            .then((rows) => rows[0] ?? null);
+          if (run) {
+            const agentRecord = await db
+              .select({ id: agents.id, status: agents.status })
+              .from(agents)
+              .where(eq(agents.id, run.agentId))
+              .then((rows) => rows[0] ?? null);
+            if (
+              agentRecord &&
+              agentRecord.status !== "terminated" &&
+              agentRecord.status !== "pending_approval"
+            ) {
+              req.actor = {
+                type: "agent",
+                agentId: run.agentId,
+                companyId: run.companyId,
+                runId: runIdHeader,
+                source: "agent_run_header",
+              };
+              next();
+              return;
+            }
+          }
+        }
+        req.actor.runId = runIdHeader;
+      }
+      // In local_trusted mode, allow agents to identify themselves via an
+      // agentId field in the request body or X-Agent-Id header.  Without this,
+      // writes from agents that lack a run-id or bearer token are silently
+      // attributed to "local-board", which can trigger infinite wake loops
+      // when the harness treats them as user-authored comments.
+      if (opts.deploymentMode === "local_trusted" && req.actor.type === "board") {
+        const bodyAgentId = req.body?.agentId as string | undefined;
+        const headerAgentId = req.header("x-agent-id");
+        const candidateAgentId = bodyAgentId || headerAgentId;
+        if (candidateAgentId) {
+          const agentRecord = await db
+            .select({ id: agents.id, status: agents.status, companyId: agents.companyId })
+            .from(agents)
+            .where(eq(agents.id, candidateAgentId))
+            .then((rows) => rows[0] ?? null);
+          if (
+            agentRecord &&
+            agentRecord.status !== "terminated" &&
+            agentRecord.status !== "pending_approval"
+          ) {
+            req.actor = {
+              type: "agent",
+              agentId: agentRecord.id,
+              companyId: agentRecord.companyId,
+              runId: runIdHeader || undefined,
+              source: "agent_body_id",
+            };
+            next();
+            return;
+          }
+        }
+      }
       next();
       return;
     }

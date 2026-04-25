@@ -788,6 +788,43 @@ export function defaultPathForPlatform() {
   return "/usr/local/bin:/opt/homebrew/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
 }
 
+function splitPathEntries(pathValue: string | undefined): string[] {
+  if (typeof pathValue !== "string" || pathValue.trim().length === 0) return [];
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  return pathValue
+    .split(delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function dedupePathEntries(entries: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const entry of entries) {
+    const key = process.platform === "win32" ? entry.toLowerCase() : entry;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(entry);
+  }
+  return unique;
+}
+
+function windowsPathCandidates(env: NodeJS.ProcessEnv): string[] {
+  const appData = env.APPDATA ?? process.env.APPDATA;
+  const localAppData = env.LOCALAPPDATA ?? process.env.LOCALAPPDATA;
+  const userProfile = env.USERPROFILE ?? process.env.USERPROFILE;
+  const programFiles = env.ProgramFiles ?? process.env.ProgramFiles;
+  const programFilesX86 = env["ProgramFiles(x86)"] ?? process.env["ProgramFiles(x86)"];
+
+  const candidates: string[] = [];
+  if (appData) candidates.push(path.join(appData, "npm"));
+  if (userProfile) candidates.push(path.join(userProfile, ".npm-global", "bin"));
+  if (localAppData) candidates.push(path.join(localAppData, "Programs", "nodejs"));
+  if (programFiles) candidates.push(path.join(programFiles, "nodejs"));
+  if (programFilesX86) candidates.push(path.join(programFilesX86, "nodejs"));
+  return candidates;
+}
+
 function windowsPathExts(env: NodeJS.ProcessEnv): string[] {
   return (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean);
 }
@@ -872,9 +909,22 @@ async function resolveSpawnTarget(
 }
 
 export function ensurePathInEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  if (typeof env.PATH === "string" && env.PATH.length > 0) return env;
-  if (typeof env.Path === "string" && env.Path.length > 0) return env;
-  return { ...env, PATH: defaultPathForPlatform() };
+  const delimiter = process.platform === "win32" ? ";" : ":";
+  const mergedEntries = dedupePathEntries([
+    ...splitPathEntries(env.PATH),
+    ...splitPathEntries(env.Path),
+    ...splitPathEntries(process.env.PATH),
+    ...splitPathEntries(process.env.Path),
+    ...(process.platform === "win32" ? windowsPathCandidates(env) : []),
+    ...splitPathEntries(defaultPathForPlatform()),
+  ]);
+
+  const pathValue = mergedEntries.length > 0 ? mergedEntries.join(delimiter) : defaultPathForPlatform();
+  const nextEnv: NodeJS.ProcessEnv = { ...env, PATH: pathValue };
+  if (process.platform === "win32") {
+    nextEnv.Path = pathValue;
+  }
+  return nextEnv;
 }
 
 export async function ensureAbsoluteDirectory(

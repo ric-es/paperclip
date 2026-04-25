@@ -202,6 +202,7 @@ export function CompanySettings() {
   const [inviteSnippet, setInviteSnippet] = useState<string | null>(null);
   const [snippetCopied, setSnippetCopied] = useState(false);
   const [snippetCopyDelightId, setSnippetCopyDelightId] = useState(0);
+  const [deleteCompanyFiles, setDeleteCompanyFiles] = useState(false);
 
   const { data: experimentalSettings } = useQuery({
     queryKey: queryKeys.instance.experimentalSettings,
@@ -461,15 +462,18 @@ export function CompanySettings() {
   const deleteMutation = useMutation({
     mutationFn: ({
       companyId,
-      nextCompanyId
+      nextCompanyId,
+      deleteFiles
     }: {
       companyId: string;
       nextCompanyId: string | null;
-    }) => companiesApi.remove(companyId).then(() => ({ nextCompanyId })),
+      deleteFiles: boolean;
+    }) => companiesApi.remove(companyId, { deleteFiles }).then(() => ({ nextCompanyId })),
     onSuccess: async ({ nextCompanyId }) => {
       if (nextCompanyId) {
         setSelectedCompanyId(nextCompanyId);
       }
+      setDeleteCompanyFiles(false);
       await queryClient.invalidateQueries({
         queryKey: queryKeys.companies.all
       });
@@ -1332,6 +1336,18 @@ export function CompanySettings() {
               </p>
             </div>
           </div>
+          <label className="flex items-start gap-2 text-sm text-muted-foreground">
+            <input
+              type="checkbox"
+              className="mt-1 h-4 w-4 accent-destructive"
+              checked={deleteCompanyFiles}
+              disabled={deleteMutation.isPending}
+              onChange={(event) => setDeleteCompanyFiles(event.currentTarget.checked)}
+            />
+            <span>
+              Also delete local files associated with this company.
+            </span>
+          </label>
           <div className="flex items-center gap-2">
             <Button
               size="sm"
@@ -1344,6 +1360,14 @@ export function CompanySettings() {
                   `This permanently deletes "${selectedCompany.name}" and its related data. Type "${confirmationText}" to confirm.`
                 );
                 if (confirmed !== confirmationText) return;
+                if (
+                  deleteCompanyFiles &&
+                  !window.confirm(
+                    "Delete local files for this company as well? This cannot be undone."
+                  )
+                ) {
+                  return;
+                }
                 const nextCompanyId =
                   companies.find(
                     (company) =>
@@ -1352,7 +1376,8 @@ export function CompanySettings() {
                   )?.id ?? null;
                 deleteMutation.mutate({
                   companyId: selectedCompanyId,
-                  nextCompanyId
+                  nextCompanyId,
+                  deleteFiles: deleteCompanyFiles
                 });
               }}
             >

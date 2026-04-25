@@ -499,4 +499,75 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       executionWorkspaceSettings: { mode: "isolated_workspace" },
     });
   });
+
+  it("archives routines owned by an agent when the agent is terminated", async () => {
+    const { companyId, agentId, projectId } = await seedFixture();
+
+    const activeRoutineId = randomUUID();
+    const pausedRoutineId = randomUUID();
+    const archivedRoutineId = randomUUID();
+    await db.insert(routines).values([
+      {
+        id: activeRoutineId,
+        companyId,
+        projectId,
+        title: "Owned active routine",
+        assigneeAgentId: agentId,
+        status: "active",
+      },
+      {
+        id: pausedRoutineId,
+        companyId,
+        projectId,
+        title: "Owned paused routine",
+        assigneeAgentId: agentId,
+        status: "paused",
+      },
+      {
+        id: archivedRoutineId,
+        companyId,
+        projectId,
+        title: "Already archived",
+        assigneeAgentId: agentId,
+        status: "archived",
+      },
+    ]);
+
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const otherRoutineId = randomUUID();
+    await db.insert(routines).values({
+      id: otherRoutineId,
+      companyId,
+      projectId,
+      title: "Belongs to different agent",
+      assigneeAgentId: otherAgentId,
+      status: "active",
+    });
+
+    const { agentService } = await vi.importActual<typeof import("../services/agents.js")>(
+      "../services/agents.js",
+    );
+    const result = await agentService(db).terminate(agentId);
+    expect(result?.status).toBe("terminated");
+
+    const routineRows = await db
+      .select({ id: routines.id, status: routines.status })
+      .from(routines);
+    const byId = new Map(routineRows.map((row) => [row.id, row.status]));
+    expect(byId.get(activeRoutineId)).toBe("archived");
+    expect(byId.get(pausedRoutineId)).toBe("archived");
+    expect(byId.get(archivedRoutineId)).toBe("archived");
+    expect(byId.get(otherRoutineId)).toBe("active");
+  });
 });

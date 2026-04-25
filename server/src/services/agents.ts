@@ -15,6 +15,7 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  routines,
 } from "@paperclipai/db";
 import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, isUuidLike, normalizeAgentUrlKey, type AgentRole } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
@@ -489,20 +490,31 @@ export function agentService(db: Db) {
       const existing = await getById(id);
       if (!existing) return null;
 
-      await db
-        .update(agents)
-        .set({
-          status: "terminated",
-          pauseReason: null,
-          pausedAt: null,
-          updatedAt: new Date(),
-        })
-        .where(eq(agents.id, id));
+      // Archive routines owned by this agent so they stop firing against a dead assignee.
+      // Other agents cannot manage another agent's routines (assertCanManageExistingRoutine
+      // requires assigneeAgentId === actor.agentId), so without this they would remain
+      // active and fail every trigger forever.
+      await db.transaction(async (tx) => {
+        await tx
+          .update(agents)
+          .set({
+            status: "terminated",
+            pauseReason: null,
+            pausedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(agents.id, id));
 
-      await db
-        .update(agentApiKeys)
-        .set({ revokedAt: new Date() })
-        .where(eq(agentApiKeys.agentId, id));
+        await tx
+          .update(agentApiKeys)
+          .set({ revokedAt: new Date() })
+          .where(eq(agentApiKeys.agentId, id));
+
+        await tx
+          .update(routines)
+          .set({ status: "archived", updatedAt: new Date() })
+          .where(and(eq(routines.assigneeAgentId, id), ne(routines.status, "archived")));
+      });
 
       return getById(id);
     },

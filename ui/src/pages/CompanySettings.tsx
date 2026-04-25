@@ -436,6 +436,7 @@ export function CompanySettings() {
     setEditingEnvironmentId(null);
     setEnvironmentForm(createEmptyEnvironmentForm());
     setProbeResults({});
+    setDeleteCompanyFiles(false);
   }, [selectedCompanyId]);
 
   const archiveMutation = useMutation({

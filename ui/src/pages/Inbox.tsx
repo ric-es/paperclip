@@ -18,6 +18,7 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useGeneralSettings } from "../context/GeneralSettingsContext";
 import { useSidebar } from "../context/SidebarContext";
 import { queryKeys } from "../lib/queryKeys";
+import { useIssueExternalObjectSummaries } from "../hooks/useIssueExternalObjects";
 import {
   applyIssueFilters,
   countActiveIssueFilters,
@@ -846,13 +847,49 @@ export function Inbox() {
 
   const mineIssues = useMemo(() => getRecentTouchedIssues(mineIssuesRaw), [mineIssuesRaw]);
   const touchedIssues = useMemo(() => getRecentTouchedIssues(touchedIssuesRaw), [touchedIssuesRaw]);
+  const shouldUseIssueSearchSupplement =
+    !!selectedCompanyId
+    && normalizedSearchQuery.length > 0;
+  const { data: remoteIssueSearchResults = [] } = useQuery({
+    queryKey: [
+      ...queryKeys.issues.search(selectedCompanyId!, normalizedSearchQuery, undefined, 25),
+      "inbox-supplement",
+    ],
+    queryFn: () =>
+      issuesApi.list(selectedCompanyId!, {
+        q: normalizedSearchQuery,
+        limit: 25,
+        includeRoutineExecutions: true,
+      }),
+    enabled: shouldUseIssueSearchSupplement,
+    placeholderData: (previousData) => previousData,
+  });
+  const inboxIssueIdsForExternalObjectSummaries = useMemo(() => {
+    const issueIds = new Set<string>();
+    for (const issue of mineIssues) issueIds.add(issue.id);
+    for (const issue of touchedIssues) issueIds.add(issue.id);
+    for (const issue of remoteIssueSearchResults) issueIds.add(issue.id);
+    return [...issueIds];
+  }, [mineIssues, remoteIssueSearchResults, touchedIssues]);
+  const {
+    summaries: externalObjectSummaryByIssueId,
+    isLoading: externalObjectSummariesLoading,
+    isReady: externalObjectSummariesReady,
+  } = useIssueExternalObjectSummaries(
+    selectedCompanyId,
+    inboxIssueIdsForExternalObjectSummaries,
+  );
+  const issueFilterContext = useMemo(() => ({
+    externalObjectSummaryByIssueId,
+    externalObjectSummariesReady: externalObjectSummariesReady && !externalObjectSummariesLoading,
+  }), [externalObjectSummariesLoading, externalObjectSummariesReady, externalObjectSummaryByIssueId]);
   const visibleMineIssues = useMemo(
-    () => applyIssueFilters(mineIssues, issueFilters, currentUserId, true, liveIssueIds),
-    [mineIssues, issueFilters, currentUserId, liveIssueIds],
+    () => applyIssueFilters(mineIssues, issueFilters, currentUserId, true, liveIssueIds, issueFilterContext),
+    [mineIssues, issueFilters, currentUserId, liveIssueIds, issueFilterContext],
   );
   const visibleTouchedIssues = useMemo(
-    () => applyIssueFilters(touchedIssues, issueFilters, currentUserId, true, liveIssueIds),
-    [touchedIssues, issueFilters, currentUserId, liveIssueIds],
+    () => applyIssueFilters(touchedIssues, issueFilters, currentUserId, true, liveIssueIds, issueFilterContext),
+    [touchedIssues, issueFilters, currentUserId, liveIssueIds, issueFilterContext],
   );
   const unreadTouchedIssues = useMemo(
     () => visibleTouchedIssues.filter((issue) => issue.isUnreadForMe),
@@ -1126,23 +1163,6 @@ export function Inbox() {
       visibleTouchedIssues,
     ],
   );
-  const shouldUseIssueSearchSupplement =
-    !!selectedCompanyId
-    && normalizedSearchQuery.length > 0;
-  const { data: remoteIssueSearchResults = [] } = useQuery({
-    queryKey: [
-      ...queryKeys.issues.search(selectedCompanyId!, normalizedSearchQuery, undefined, 25),
-      "inbox-supplement",
-    ],
-    queryFn: () =>
-      issuesApi.list(selectedCompanyId!, {
-        q: normalizedSearchQuery,
-        limit: 25,
-        includeRoutineExecutions: true,
-      }),
-    enabled: shouldUseIssueSearchSupplement,
-    placeholderData: (previousData) => previousData,
-  });
   const issueSearchSupplementResults = useMemo(
     () =>
       getInboxSearchSupplementIssues({
@@ -1154,11 +1174,13 @@ export function Inbox() {
         currentUserId,
         enableRoutineVisibilityFilter: true,
         liveIssueIds,
+        issueFilterContext,
       }),
     [
       archivedSearchIssues,
       currentUserId,
       filteredWorkItems,
+      issueFilterContext,
       issueFilters,
       liveIssueIds,
       normalizedSearchQuery,
@@ -2155,6 +2177,7 @@ export function Inbox() {
                       key={`issue:${issue.id}`}
                       issue={issue}
                       issueLinkState={issueLinkState}
+                      externalObjectSummary={externalObjectSummaryByIssueId.get(issue.id) ?? null}
                       selected={selected}
                       className={
                         isArchiving

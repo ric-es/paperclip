@@ -11,6 +11,7 @@ import {
   defaultIssueFilterState,
   normalizeIssueFilterState,
   type IssueFilterState,
+  type IssueFilterWorkspaceContext,
 } from "./issue-filters";
 
 export const RECENT_ISSUES_LIMIT = 100;
@@ -446,6 +447,7 @@ export function getInboxSearchSupplementIssues({
   currentUserId,
   enableRoutineVisibilityFilter = false,
   liveIssueIds,
+  issueFilterContext = {},
 }: {
   query: string;
   filteredWorkItems: InboxWorkItem[];
@@ -455,6 +457,7 @@ export function getInboxSearchSupplementIssues({
   currentUserId?: string | null;
   enableRoutineVisibilityFilter?: boolean;
   liveIssueIds?: ReadonlySet<string>;
+  issueFilterContext?: IssueFilterWorkspaceContext;
 }): Issue[] {
   const normalizedQuery = query.trim();
   if (!normalizedQuery) return [];
@@ -464,7 +467,14 @@ export function getInboxSearchSupplementIssues({
       .map((item) => item.issue.id),
     ...archivedSearchIssues.map((issue) => issue.id),
   ]);
-  return applyIssueFilters(remoteIssues, issueFilters, currentUserId, enableRoutineVisibilityFilter, liveIssueIds)
+  return applyIssueFilters(
+    remoteIssues,
+    issueFilters,
+    currentUserId,
+    enableRoutineVisibilityFilter,
+    liveIssueIds,
+    issueFilterContext,
+  )
     .filter((issue) => !visibleIssueIds.has(issue.id));
 }
 

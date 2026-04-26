@@ -116,6 +116,13 @@ export type {
   IssueWorkProductReviewState,
 } from "./work-product.js";
 export type {
+  ExternalObject,
+  ExternalObjectMention,
+  ExternalObjectMentionGroup,
+  ExternalObjectSummary,
+  ExternalObjectSummaryItem,
+} from "./external-object.js";
+export type {
   Issue,
   IssueAssigneeAdapterOverrides,
   IssueBlockerAttention,
@@ -304,6 +311,8 @@ export type {
   PluginDatabaseDeclaration,
   PluginApiRouteCompanyResolution,
   PluginApiRouteDeclaration,
+  PluginObjectReferenceRefreshPolicy,
+  PluginObjectReferenceProviderDeclaration,
   PaperclipPluginManifestV1,
   PluginRecord,
   PluginDatabaseNamespaceRecord,

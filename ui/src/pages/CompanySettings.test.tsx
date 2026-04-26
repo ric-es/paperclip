@@ -7,6 +7,7 @@ import { AGENT_ADAPTER_TYPES, getEnvironmentCapabilities } from "@paperclipai/sh
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanySettings } from "./CompanySettings";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { MemoryRouter } from "@/lib/router";
 
 const mockCompaniesApi = vi.hoisted(() => ({
   update: vi.fn(),
@@ -144,11 +145,13 @@ describe("CompanySettings", () => {
 
     await act(async () => {
       root.render(
-        <QueryClientProvider client={queryClient}>
-          <TooltipProvider>
-            <CompanySettings />
-          </TooltipProvider>
-        </QueryClientProvider>,
+        <MemoryRouter>
+          <QueryClientProvider client={queryClient}>
+            <TooltipProvider>
+              <CompanySettings />
+            </TooltipProvider>
+          </QueryClientProvider>
+        </MemoryRouter>,
       );
     });
     await flushReact();
@@ -210,11 +213,13 @@ describe("CompanySettings", () => {
 
     await act(async () => {
       root.render(
-        <QueryClientProvider client={queryClient}>
-          <TooltipProvider>
-            <CompanySettings />
-          </TooltipProvider>
-        </QueryClientProvider>,
+        <MemoryRouter>
+          <QueryClientProvider client={queryClient}>
+            <TooltipProvider>
+              <CompanySettings />
+            </TooltipProvider>
+          </QueryClientProvider>
+        </MemoryRouter>,
       );
     });
     await flushReact();

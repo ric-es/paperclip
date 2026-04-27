@@ -1026,6 +1026,8 @@ function normalizeLedgerBillingType(value: unknown): BillingType {
       return "credits";
     case "fixed":
       return "fixed";
+    case "estimated_cost":
+      return "estimated_cost";
     default:
       return "unknown";
   }

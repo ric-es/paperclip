@@ -2,6 +2,8 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BookOpen,
+  ChevronsLeft,
+  ChevronsRight,
   LogOut,
   type LucideIcon,
   Moon,
@@ -110,7 +112,7 @@ export function SidebarAccountMenu({
 }: SidebarAccountMenuProps) {
   const [internalOpen, setInternalOpen] = useState(false);
   const queryClient = useQueryClient();
-  const { isMobile, setSidebarOpen } = useSidebar();
+  const { isMobile, setSidebarOpen, collapsed, toggleSidebar } = useSidebar();
   const { theme, toggleTheme } = useTheme();
   const open = controlledOpen ?? internalOpen;
   const setOpen = onOpenChange ?? setInternalOpen;
@@ -141,19 +143,25 @@ export function SidebarAccountMenu({
   }
 
   return (
-    <div className="border-t border-r border-border bg-background px-3 py-2">
+    <div className={cn(
+      "border-t border-r border-border bg-background py-2 flex items-center overflow-hidden",
+      collapsed ? "px-1 gap-0" : "px-3 gap-1",
+    )}>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
             type="button"
-            className="flex w-full items-center gap-2.5 px-3 py-2 text-left text-[13px] font-medium text-foreground/80 transition-colors hover:bg-accent/50 hover:text-foreground"
+            className={cn(
+              "flex items-center text-left text-[13px] font-medium text-foreground/80 transition-colors hover:bg-accent/50 hover:text-foreground",
+              collapsed ? "justify-center px-0 py-2" : "flex-1 min-w-0 gap-2.5 px-3 py-2",
+            )}
             aria-label="Open account menu"
           >
             <Avatar size="sm">
               {session?.user.image ? <AvatarImage src={session.user.image} alt={displayName} /> : null}
               <AvatarFallback>{initials}</AvatarFallback>
             </Avatar>
-            <span className="min-w-0 flex-1 truncate">{displayName}</span>
+            {!collapsed && <span className="min-w-0 flex-1 truncate">{displayName}</span>}
           </button>
         </PopoverTrigger>
         <PopoverContent
@@ -251,6 +259,21 @@ export function SidebarAccountMenu({
           </div>
         </PopoverContent>
       </Popover>
+      {!isMobile && (
+        <button
+          type="button"
+          onClick={toggleSidebar}
+          className={cn(
+            "flex items-center justify-center text-foreground/80 transition-colors hover:bg-accent/50 hover:text-foreground",
+            "ml-auto",
+            collapsed ? "w-12 px-0 py-2" : "px-3 py-2",
+          )}
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
+          {collapsed ? <ChevronsRight className="h-4 w-4" /> : <ChevronsLeft className="h-4 w-4" />}
+        </button>
+      )}
     </div>
   );
 }

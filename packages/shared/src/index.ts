@@ -206,6 +206,7 @@ export {
 
 export {
   ALL_INTERFACES_BIND_HOST,
+  ALL_INTERFACES_BIND_HOST_IPV6,
   LOOPBACK_BIND_HOST,
   inferBindModeFromHost,
   isAllInterfacesHost,

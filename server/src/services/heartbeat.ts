@@ -6,21 +6,11 @@ import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
-  AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
-  ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
-  isEnvironmentDriverSupportedForAdapter,
-  type BillingType,
-  type EnvironmentLeaseStatus,
-  type ExecutionWorkspace,
-  type ExecutionWorkspaceConfig,
-  type RunLivenessState,
-} from "@paperclipai/shared";
-import {
+  activityLog,
   agents,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
-  activityLog,
   companySkills as companySkillsTable,
   documentRevisions,
   issueDocuments,
@@ -89,7 +79,7 @@ import {
 } from "./issue-continuation-summary.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
-import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
+import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
@@ -120,7 +110,17 @@ import {
   readPaperclipSkillSyncPreference,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
-import { extractSkillMentionIds } from "@paperclipai/shared";
+import {
+  extractSkillMentionIds,
+  AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  isEnvironmentDriverSupportedForAdapter,
+  type BillingType,
+  type EnvironmentLeaseStatus,
+  type ExecutionWorkspace,
+  type ExecutionWorkspaceConfig,
+  type RunLivenessState,
+} from "@paperclipai/shared";
 import { environmentService } from "./environments.js";
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
@@ -129,6 +129,12 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
+
+function isCompanyBudgetConflict(error: unknown): error is HttpError {
+  if (!(error instanceof HttpError) || error.status !== 409) return false;
+  if (typeof error.details !== "object" || error.details === null) return false;
+  return "scopeType" in error.details && (error.details as { scopeType?: unknown }).scopeType === "company";
+}
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
 const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
 const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
@@ -4355,7 +4361,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
+      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
+      const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
+      // For local child-process adapters, the OS is the source of truth for liveness.
+      // For remote adapters (no local PID), the in-memory Set is the only signal we have,
+      // so treat them as alive when tracked to preserve existing behavior.
+      const processActuallyAlive = !tracksLocalChild || Boolean(processPidAlive) || Boolean(processGroupAlive);
+
+      // Skip only when in-memory tracks AND the process is believed alive.
+      // If tracksLocalChild is true but the OS says the PID/PGID is dead, the
+      // in-memory Set has leaked (SIGKILL/OOM/crash with no cleanup handler) —
+      // proceed to reap instead of short-circuiting forever.
+      if ((runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) && processActuallyAlive) {
+        continue;
+      }
+
+      // Proactively drop leaked in-memory entries so subsequent ticks do not re-block on them.
+      runningProcesses.delete(run.id);
+      activeRunExecutions.delete(run.id);
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -4363,9 +4387,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
 
-      const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
-      const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
-      const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
@@ -5898,6 +5919,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
+    type TerminalSkipEntry = {
+      companyId: string;
+      issueId: string;
+      issueStatus: string;
+      identifier: string | null;
+      agentId: string;
+      runId: string;
+      source:
+        | "deferred_comment_wake_terminal_skipped"
+        | "deferred_comment_wake_all_comments_deleted";
+    };
+    type PromotionResult =
+      | null
+      | { run: null; skippedTerminalWakes: TerminalSkipEntry[]; reopenedActivity: LogActivityInput | null }
+      | { run: typeof heartbeatRuns.$inferSelect; skippedTerminalWakes: TerminalSkipEntry[]; reopenedActivity: LogActivityInput | null };
+
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -5949,6 +5986,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(eq(issues.id, issue.id));
       }
 
+      const terminalSkipWakes: TerminalSkipEntry[] = [];
+
       while (true) {
         const deferred = await tx
           .select()
@@ -5964,7 +6003,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .limit(1)
           .then((rows) => rows[0] ?? null);
 
-        if (!deferred) break;
+        if (!deferred) return terminalSkipWakes.length > 0 ? { run: null, skippedTerminalWakes: terminalSkipWakes, reopenedActivity: null } : null;
 
         const deferredAgent = await tx
           .select()
@@ -6028,35 +6067,121 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
-        const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
-        // Only human/comment-reopen interactions should revive completed issues;
-        // system follow-ups such as retry or cleanup wakes must not reopen closed work.
-        const shouldReopenDeferredCommentWake =
-          deferredCommentIds.length > 0 &&
-          (issue.status === "done" || issue.status === "cancelled") &&
-          (
-            deferred.requestedByActorType === "user" ||
-            deferredWakeReason === "issue_reopened_via_comment"
-          );
-        let reopenedActivity: LogActivityInput | null = null;
+        const issueIsTerminal = issue.status === "done" || issue.status === "cancelled";
+        // The freshness/reopen branches below defend the assignee's terminal
+        // decision. Cross-agent wakes (e.g. an @-mention waking a non-assignee)
+        // shouldn't reopen the issue or be dropped on staleness — the mentioned
+        // agent should still be informed of the comment, with the issue's
+        // current status carried through.
+        const isAssigneeWake = issue.assigneeAgentId === deferredAgent.id;
 
-        if (shouldReopenDeferredCommentWake) {
+        // POI-237 Option 1 — deferred-wake freshness guard. When a comment-bearing
+        // deferred wake targets a terminal issue *that the deferred agent owns*,
+        // only allow promotion if at least one deferred comment was created
+        // AFTER the last terminal transition. Stale wakes (enqueued before the
+        // issue closed) are dropped. Fresh wakes fall through to the normal
+        // promotion path below.
+        if (deferredCommentIds.length > 0 && issueIsTerminal && isAssigneeWake) {
+          const closureRow = await tx
+            .select({ createdAt: activityLog.createdAt })
+            .from(activityLog)
+            .where(
+              and(
+                eq(activityLog.companyId, issue.companyId),
+                eq(activityLog.entityType, "issue"),
+                eq(activityLog.entityId, issue.id),
+                eq(activityLog.action, "issue.updated"),
+                sql`${activityLog.details} ->> 'status' in ('done','cancelled')`,
+              ),
+            )
+            .orderBy(desc(activityLog.createdAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+
+          // Fall back to issue.completedAt / issue.cancelledAt when the activity
+          // log entry is missing — closure paths that don't go through
+          // issuesSvc.update() (recovery code, direct DB updates) leave the log
+          // empty, which would silently no-op the freshness guard and let the
+          // wake reopen the issue on unverifiable evidence. Both columns are
+          // reset to null on reopen, so they reliably reflect the *current*
+          // terminal transition.
+          const issueClosedAt =
+            issue.status === "done"
+              ? issue.completedAt
+              : issue.status === "cancelled"
+                ? issue.cancelledAt
+                : null;
+          const closedAt = closureRow?.createdAt ?? issueClosedAt ?? null;
+          if (closedAt) {
+            const commentRows = await tx
+              .select({ id: issueComments.id, createdAt: issueComments.createdAt })
+              .from(issueComments)
+              .where(
+                and(
+                  eq(issueComments.issueId, issue.id),
+                  inArray(issueComments.id, deferredCommentIds),
+                ),
+              );
+            // POI-247 — explicit branch: if every deferred comment id has been
+            // hard-deleted since the wake was enqueued, `commentRows` is empty and
+            // freshness cannot be verified. Drop the wake under a distinct error
+            // code. Reopening a terminal issue on unverifiable evidence is worse
+            // than a silent drop, and the separate code lets observability split
+            // this case from the ordinary stale-wake path.
+            const allDeleted = commentRows.length === 0;
+            // `anyFresh` is tautologically false when `allDeleted` is true
+            // (`some` on an empty array returns false). `allDeleted` is checked
+            // first as a ternary selector to emit a distinct observability
+            // error code (`..._all_comments_deleted`) instead of collapsing
+            // the hard-delete case into the generic stale-wake path.
+            const anyFresh = commentRows.some(
+              (row) => row.createdAt.getTime() > closedAt.getTime(),
+            );
+            if (allDeleted || !anyFresh) {
+              await tx
+                .update(agentWakeupRequests)
+                .set({
+                  status: "failed",
+                  finishedAt: new Date(),
+                  error: allDeleted
+                    ? "deferred_comment_wake_all_comments_deleted"
+                    : "deferred_comment_wake_terminal_skipped",
+                  updatedAt: new Date(),
+                })
+                .where(eq(agentWakeupRequests.id, deferred.id));
+              terminalSkipWakes.push({
+                companyId: issue.companyId,
+                issueId: issue.id,
+                issueStatus: issue.status,
+                identifier: issue.identifier,
+                agentId: deferred.agentId,
+                runId: run.id,
+                source: allDeleted
+                  ? "deferred_comment_wake_all_comments_deleted"
+                  : "deferred_comment_wake_terminal_skipped",
+              });
+              continue;
+            }
+          }
+          // No audit entry — lenient fallback: treat as fresh and proceed with promotion.
+        }
+
+        // Fresh comment on a terminal issue: reopen to "todo" so the assignee
+        // receives it in an actionable state. Cross-agent (mention) wakes are
+        // excluded — they're notifications, not ownership transfers, so we
+        // promote the wake without disturbing the assignee's terminal state.
+        // Activity log entry is emitted after the transaction so it uses the
+        // outer db (not the tx snapshot).
+        let reopenedActivity: LogActivityInput | null = null;
+        if (deferredCommentIds.length > 0 && issueIsTerminal && isAssigneeWake) {
           const reopenedFromStatus = issue.status;
           const reopenedIssue = await issuesSvc.update(
             issue.id,
-            {
-              status: "todo",
-              executionState: null,
-            },
+            { status: "todo", executionState: null, allowTerminalReopen: true },
             tx,
           );
           if (reopenedIssue) {
-            issue = {
-              ...issue,
-              identifier: reopenedIssue.identifier,
-              status: reopenedIssue.status,
-              executionRunId: reopenedIssue.executionRunId,
-            };
+            issue = { ...issue, identifier: reopenedIssue.identifier, status: reopenedIssue.status, executionRunId: reopenedIssue.executionRunId };
             if (!readNonEmptyString(promotedContextSeed.reopenedFrom)) {
               promotedContextSeed.reopenedFrom = reopenedFromStatus;
             }
@@ -6149,6 +6274,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return {
           kind: "promoted" as const,
           run: newRun,
+          skippedTerminalWakes: terminalSkipWakes,
           reopenedActivity,
         };
       }
@@ -6284,12 +6410,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return;
     }
 
-    const promotedRun = promotionResult?.run ?? null;
-    if (!promotedRun) return;
-
-    if (promotionResult?.kind === "promoted" && promotionResult.reopenedActivity) {
+    if (promotionResult?.reopenedActivity) {
       await logActivity(db, promotionResult.reopenedActivity);
     }
+
+    // Emit one audit log entry per skipped terminal wake. Skips are a normal
+    // outcome of the freshness guard (POI-237/POI-247) — they need to be
+    // observable independently of whether a downstream wake was promoted in
+    // the same iteration. The mixed-cycle test (POI-165) asserts this entry
+    // exists alongside a successful promotion in the same tick.
+    if (promotionResult && "skippedTerminalWakes" in promotionResult) {
+      for (const skip of promotionResult.skippedTerminalWakes ?? []) {
+        await logActivity(db, {
+          companyId: skip.companyId,
+          actorType: "system",
+          actorId: "heartbeat",
+          agentId: skip.agentId,
+          runId: skip.runId,
+          action: "issue.wake_ignored_terminal",
+          entityType: "issue",
+          entityId: skip.issueId,
+          details: {
+            source: skip.source,
+            identifier: skip.identifier,
+            issueStatus: skip.issueStatus,
+          },
+        });
+      }
+    }
+
+    const promotedRun = promotionResult?.run ?? null;
+    if (!promotedRun) return;
 
     publishLiveEvent({
       companyId: promotedRun.companyId,
@@ -7499,20 +7650,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
-        const run = await enqueueWakeup(agent.id, {
-          source: "timer",
-          triggerDetail: "system",
-          reason: "heartbeat_timer",
-          requestedByActorType: "system",
-          requestedByActorId: "heartbeat_scheduler",
-          contextSnapshot: {
-            source: "scheduler",
-            reason: "interval_elapsed",
-            now: now.toISOString(),
-          },
-        });
-        if (run) enqueued += 1;
-        else skipped += 1;
+        try {
+          const run = await enqueueWakeup(agent.id, {
+            source: "timer",
+            triggerDetail: "system",
+            reason: "heartbeat_timer",
+            requestedByActorType: "system",
+            requestedByActorId: "heartbeat_scheduler",
+            contextSnapshot: {
+              source: "scheduler",
+              reason: "interval_elapsed",
+              now: now.toISOString(),
+            },
+          });
+          if (run) enqueued += 1;
+          else skipped += 1;
+        } catch (error) {
+          if (isCompanyBudgetConflict(error)) {
+            skipped += 1;
+            continue;
+          }
+          throw error;
+        }
       }
 
       return { checked, enqueued, skipped };

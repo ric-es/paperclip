@@ -80,6 +80,7 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
+import { runPostDoneCleanup } from "../services/post-done-cleanup.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
@@ -394,6 +395,8 @@ export function issueRoutes(
         now?: Date;
       }): Promise<unknown>;
     };
+    postDoneCleanupEnabled?: boolean;
+    postDoneCleanupAllowedRoots?: string[];
     pluginWorkerManager?: PluginWorkerManager;
   } = {},
 ) {
@@ -1999,6 +2002,11 @@ export function issueRoutes(
       updateFields.status === undefined
     ) {
       updateFields.status = "todo";
+      updateFields.allowTerminalReopen = true;
+    }
+    // Direct status PATCH on a terminal issue is an intentional reopen.
+    if (isClosed && typeof updateFields.status === "string" && !isClosedIssueStatus(updateFields.status)) {
+      updateFields.allowTerminalReopen = true;
     }
     if (req.body.executionPolicy !== undefined) {
       updateFields.executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
@@ -2603,6 +2611,15 @@ export function issueRoutes(
             },
           });
         }
+      }
+
+      if (becameDone && opts?.postDoneCleanupEnabled) {
+        runPostDoneCleanup({
+          db,
+          issueId: issue.id,
+          issueIdentifier: issue.identifier ?? issue.id,
+          allowedRoots: opts.postDoneCleanupAllowedRoots,
+        }).catch((err) => logger.warn({ err, issueId: issue.id }, "post-done-cleanup: unexpected error"));
       }
 
       const becameTerminal =
@@ -3306,6 +3323,16 @@ export function issueRoutes(
 
   router.post("/issues/:id/comments", validate(addIssueCommentSchema), async (req, res) => {
     const id = req.params.id as string;
+
+    // Agent heartbeat context with missing/expired JWT must be rejected loudly (POI-238).
+    // Agents always send X-Paperclip-Run-Id; if it's present but auth resolved to non-agent,
+    // the JWT was missing or failed verification — do not silently attribute to local-board.
+    const hasRunId = !!req.header("x-paperclip-run-id");
+    if (hasRunId && req.actor.type !== "agent") {
+      res.status(401).json({ error: "agent_jwt_required", reason: "missing_or_expired" });
+      return;
+    }
+
     const issue = await svc.getById(id);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });

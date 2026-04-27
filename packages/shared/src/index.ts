@@ -263,6 +263,7 @@ export type {
   IssueComment,
   IssueDocument,
   IssueDocumentSummary,
+  CompanyDocumentListItem,
   DocumentRevision,
   DocumentFormat,
   LegacyPlanDocument,

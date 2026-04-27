@@ -4,6 +4,7 @@ import {
   Target,
   LayoutDashboard,
   DollarSign,
+  FileText,
   History,
   Search,
   SquarePen,
@@ -101,6 +102,7 @@ export function Sidebar() {
           <SidebarNavItem to="/issues" label="Issues" icon={CircleDot} />
           <SidebarNavItem to="/routines" label="Routines" icon={Repeat} />
           <SidebarNavItem to="/goals" label="Goals" icon={Target} />
+          <SidebarNavItem to="/documents" label="Documents" icon={FileText} />
         </SidebarSection>
 
         <SidebarProjects />

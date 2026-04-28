@@ -509,6 +509,10 @@ export type {
   PluginWebhookDeliveryRecord,
   QuotaWindow,
   ProviderQuotaResult,
+  ExecutionThreadIssueSummary,
+  ExecutionThreadEntryKind,
+  ExecutionThreadEntry,
+  ExecutionThreadResponse,
 } from "./types/index.js";
 export {
   ISSUE_REFERENCE_IDENTIFIER_RE,

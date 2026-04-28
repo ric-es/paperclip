@@ -985,18 +985,55 @@ async function ensureRepairTargetWorktree(input: {
 }
 
 function resolveSourceConnectionString(config: PaperclipConfig, envEntries: Record<string, string>, portOverride?: number): string {
-  if (config.database.mode === "postgres") {
-    const connectionString = nonEmpty(envEntries.DATABASE_URL) ?? nonEmpty(config.database.connectionString);
-    if (!connectionString) {
-      throw new Error(
-        "Source instance uses postgres mode but has no connection string in config or adjacent .env.",
-      );
-    }
+  const connectionString =
+    nonEmpty(envEntries.DATABASE_URL) ??
+    (config.database.mode === "postgres" ? nonEmpty(config.database.connectionString) : null);
+  if (connectionString) {
     return connectionString;
+  }
+
+  if (config.database.mode === "postgres") {
+    throw new Error(
+      "Source instance uses postgres mode but has no connection string in config or adjacent .env.",
+    );
   }
 
   const port = portOverride ?? config.database.embeddedPostgresPort;
   return `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+}
+
+type ResolvedSourceDatabaseTarget =
+  | { mode: "postgres"; connectionString: string }
+  | { mode: "embedded-postgres"; preferredPort: number };
+
+function resolveSourceDatabaseTarget(input: {
+  sourceConfigPath: string;
+  config: PaperclipConfig;
+  envEntries: Record<string, string>;
+}): ResolvedSourceDatabaseTarget {
+  const allowProcessEnvFallback = isCurrentSourceConfigPath(input.sourceConfigPath);
+  const connectionString =
+    (allowProcessEnvFallback ? nonEmpty(process.env.DATABASE_URL) : null) ??
+    nonEmpty(input.envEntries.DATABASE_URL) ??
+    (input.config.database.mode === "postgres" ? nonEmpty(input.config.database.connectionString) : null);
+
+  if (connectionString) {
+    return {
+      mode: "postgres",
+      connectionString,
+    };
+  }
+
+  if (input.config.database.mode === "postgres") {
+    throw new Error(
+      "Source instance uses postgres mode but has no connection string in config, adjacent .env, or current process environment.",
+    );
+  }
+
+  return {
+    mode: "embedded-postgres",
+    preferredPort: input.config.database.embeddedPostgresPort,
+  };
 }
 
 export function copySeededSecretsKey(input: {
@@ -1293,19 +1330,23 @@ async function seedWorktreeDatabase(input: {
   let targetHandle: EmbeddedPostgresHandle | null = null;
 
   try {
-    if (input.sourceConfig.database.mode === "embedded-postgres") {
+    const sourceDatabaseTarget = resolveSourceDatabaseTarget({
+      sourceConfigPath: input.sourceConfigPath,
+      config: input.sourceConfig,
+      envEntries: sourceEnvEntries,
+    });
+    if (sourceDatabaseTarget.mode === "embedded-postgres") {
       sourceHandle = await ensureEmbeddedPostgres(
         input.sourceConfig.database.embeddedPostgresDataDir,
-        input.sourceConfig.database.embeddedPostgresPort,
+        sourceDatabaseTarget.preferredPort,
       );
       const sourceAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${sourceHandle.port}/postgres`;
       await ensurePostgresDatabase(sourceAdminConnectionString, "paperclip");
     }
-    const sourceConnectionString = resolveSourceConnectionString(
-      input.sourceConfig,
-      sourceEnvEntries,
-      sourceHandle?.port,
-    );
+    const sourceConnectionString =
+      sourceDatabaseTarget.mode === "postgres"
+        ? sourceDatabaseTarget.connectionString
+        : resolveSourceConnectionString(input.sourceConfig, sourceEnvEntries, sourceHandle?.port);
     const backup = await runDatabaseBackup({
       connectionString: sourceConnectionString,
       backupDir: path.resolve(input.targetPaths.backupDir, "seed"),
@@ -1922,16 +1963,24 @@ async function openConfiguredDb(configPath: string): Promise<OpenDbHandle> {
     throw new Error(`Config not found at ${configPath}.`);
   }
   const envEntries = readPaperclipEnvEntries(resolvePaperclipEnvFile(configPath));
+  const sourceDatabaseTarget = resolveSourceDatabaseTarget({
+    sourceConfigPath: configPath,
+    config,
+    envEntries,
+  });
   let embeddedHandle: EmbeddedPostgresHandle | null = null;
 
   try {
-    if (config.database.mode === "embedded-postgres") {
+    if (sourceDatabaseTarget.mode === "embedded-postgres") {
       embeddedHandle = await ensureEmbeddedPostgres(
         config.database.embeddedPostgresDataDir,
-        config.database.embeddedPostgresPort,
+        sourceDatabaseTarget.preferredPort,
       );
     }
-    const connectionString = resolveSourceConnectionString(config, envEntries, embeddedHandle?.port);
+    const connectionString =
+      sourceDatabaseTarget.mode === "postgres"
+        ? sourceDatabaseTarget.connectionString
+        : resolveSourceConnectionString(config, envEntries, embeddedHandle?.port);
     const migrationState = await inspectMigrations(connectionString);
     if (migrationState.status !== "upToDate") {
       const pending =

@@ -51,6 +51,7 @@ import {
   Rocket,
   ArrowLeft,
   ArrowRight,
+  Globe,
   Check,
   Loader2,
   ChevronDown,
@@ -207,7 +208,7 @@ export function OnboardingWizard() {
   // Build adapter grids dynamically from the UI registry + display metadata.
   // External/plugin adapters automatically appear with generic defaults.
   const { recommendedAdapters, moreAdapters } = useMemo(() => {
-    const SYSTEM_ADAPTER_TYPES = new Set(["process", "http"]);
+    const SYSTEM_ADAPTER_TYPES = new Set(["process"]);
     const all = listUIAdapters()
       .filter((a) => !SYSTEM_ADAPTER_TYPES.has(a.type) && !disabledTypes.has(a.type))
       .map((a) => ({ ...getAdapterDisplay(a.type), type: a.type }));
@@ -646,7 +647,7 @@ export function OnboardingWizard() {
               step === 1 ? "md:w-1/2" : "md:w-full"
             )}
           >
-            <div className="w-full max-w-md mx-auto my-auto px-8 py-12 shrink-0">
+            <div className="w-full max-w-md mx-auto px-8 py-12">
               {/* Progress tabs */}
               <div className="flex items-center gap-0 mb-8 border-b border-border">
                 {(

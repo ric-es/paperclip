@@ -156,6 +156,7 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_r
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+type CancelSource = "user_initiated" | "system" | "budget";
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -3761,11 +3762,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
     if (!agent) {
-      await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
+      await cancelRunInternal(run.id, "Cancelled because the agent no longer exists", "system");
       return null;
     }
     if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
-      await cancelRunInternal(run.id, "Cancelled because the agent is not invokable");
+      await cancelRunInternal(run.id, "Cancelled because the agent is not invokable", "system");
       return null;
     }
 
@@ -3775,7 +3776,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       projectId: readNonEmptyString(context.projectId),
     });
     if (budgetBlock) {
-      await cancelRunInternal(run.id, budgetBlock.reason);
+      await cancelRunInternal(run.id, budgetBlock.reason, "budget");
       return null;
     }
 
@@ -3791,7 +3792,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         contextSnapshot: context,
       });
       if (activePauseHold && !treeHoldInteractionWake) {
-        await cancelRunInternal(run.id, "Cancelled because issue is held by an active subtree pause hold");
+        await cancelRunInternal(run.id, "Cancelled because issue is held by an active subtree pause hold", "system");
         await logActivity(db, {
           companyId: run.companyId,
           actorType: "system",
@@ -5936,7 +5937,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     );
   }
 
-  async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
+  async function releaseIssueExecutionAndPromote(
+    run: typeof heartbeatRuns.$inferSelect,
+    opts: { suppressContinuationRecovery?: boolean } = {},
+  ) {
     const runContext = parseObject(run.contextSnapshot);
     const contextIssueId = readNonEmptyString(runContext.issueId);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(runContext, null);
@@ -6068,8 +6072,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         const deferredCommentIds = extractWakeCommentIds(deferredContextSeed);
         const deferredWakeReason = readNonEmptyString(deferredContextSeed.wakeReason);
-        // Only human/comment-reopen interactions should revive completed issues;
-        // system follow-ups such as retry or cleanup wakes must not reopen closed work.
+        const isBlockedDeferredCommentWake =
+          deferredCommentIds.length > 0 &&
+          (issue.status === "done" || issue.status === "cancelled") &&
+          ((deferred.requestedByActorType === "agent" && deferred.requestedByActorId === run.agentId) ||
+            issue.originKind === "routine_execution");
+        if (isBlockedDeferredCommentWake) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Deferred wake suppressed: resurrection loop guard (same-agent or routine-execution issue)",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
         const shouldReopenDeferredCommentWake =
           deferredCommentIds.length > 0 &&
           (issue.status === "done" || issue.status === "cancelled") &&
@@ -6227,6 +6246,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issue.originKind === RECOVERY_ORIGIN_KINDS.strandedIssueRecovery ||
         !recoveryAgentInvokable ||
         !recoveryAgent ||
+        opts.suppressContinuationRecovery ||
         didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
       if (shouldBlockImmediately) {
         const comment = buildImmediateExecutionPathRecoveryComment({
@@ -6347,6 +6367,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
+    // Generic idempotency gate: if an idempotencyKey is provided and a non-failed
+    // wakeup with the same key already exists for this agent, skip insertion.
+    if (opts.idempotencyKey) {
+      const existing = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (existing) return null;
+    }
+
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
@@ -6491,6 +6529,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           interaction: true,
         };
       }
+    }
+
+    // Suppress wakeups where the requesting agent is the same agent being woken
+    // via an automation event. These are self-triggered events (e.g. agent posts
+    // a comment → comment wake fires back to the same agent). Route-level checks
+    // handle the common case; this is belt-and-suspenders for execution-stage and
+    // other paths that lack a per-caller self-check.
+    if (
+      opts.requestedByActorType === "agent" &&
+      opts.requestedByActorId === agentId &&
+      source === "automation"
+    ) {
+      await writeSkippedRequest("self_event_suppression");
+      return null;
     }
 
     if (issueId) {
@@ -6927,6 +6979,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES])))
       .orderBy(desc(heartbeatRuns.createdAt));
 
+    // Dedup: if this wake carries a comment ID that an active run already has in
+    // its context, the comment is already queued to be processed — coalesce into
+    // that run instead of spawning a follower. This stops the cascade where each
+    // comment the agent posts generates a new wakeup that bypasses the same-scope
+    // running-run coalesce gate via shouldQueueFollowupForCommentWake.
+    // The check and update run inside a transaction with FOR UPDATE so two concurrent
+    // wakeups carrying the same wakeCommentId cannot both fall through to enqueue.
+    if (wakeCommentId) {
+      const runWithSameComment = activeRuns.find((run) => {
+        const ctx = parseObject(run.contextSnapshot);
+        return extractWakeCommentIds(ctx).includes(wakeCommentId) || readNonEmptyString(ctx.wakeCommentId) === wakeCommentId;
+      });
+      if (runWithSameComment) {
+        const coalesced = await db.transaction(async (tx) => {
+          await tx.execute(
+            sql`select id from heartbeat_runs where id = ${runWithSameComment.id} for update`,
+          );
+          const [current] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runWithSameComment.id));
+          if (!current || !EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.includes(current.status as typeof EXECUTION_PATH_HEARTBEAT_RUN_STATUSES[number])) return null;
+          const mergedContextSnapshot = mergeCoalescedContextSnapshot(
+            current.contextSnapshot,
+            enrichedContextSnapshot,
+          );
+          await tx
+            .update(heartbeatRuns)
+            .set({ contextSnapshot: mergedContextSnapshot, updatedAt: new Date() })
+            .where(eq(heartbeatRuns.id, current.id));
+          await tx.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId,
+            source,
+            triggerDetail,
+            reason,
+            payload,
+            status: "coalesced",
+            coalescedCount: 1,
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            idempotencyKey: opts.idempotencyKey ?? null,
+            runId: current.id,
+            finishedAt: new Date(),
+          });
+          return current;
+        });
+        if (coalesced) return coalesced;
+      }
+    }
+
     const sameScopeQueuedRun = activeRuns.find(
       (candidate) => candidate.status === "queued" && isSameTaskScope(runTaskKey(candidate), taskKey),
     );
@@ -7136,7 +7236,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return wakeupIds.length;
   }
 
-  async function cancelRunInternal(runId: string, reason = "Cancelled by control plane") {
+  async function cancelRunInternal(runId: string, reason?: string, cancelSource?: CancelSource) {
+    const resolvedReason = reason ?? (cancelSource === "user_initiated" ? "Cancelled by user" : "Cancelled by control plane");
+    const userInitiated = cancelSource === "user_initiated";
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
@@ -7158,20 +7260,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt: new Date(),
-      error: reason,
+      error: resolvedReason,
       errorCode: "cancelled",
+      ...(cancelSource ? { cancelSource } : {}),
       ...(agent ? {
         resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
           resultJson: parseObject(run.resultJson),
           errorCode: "cancelled",
-          errorMessage: reason,
+          errorMessage: resolvedReason,
         }),
       } : {}),
     });
 
     await setWakeupStatus(run.wakeupRequestId, "cancelled", {
       finishedAt: new Date(),
-      error: reason,
+      error: resolvedReason,
     });
 
     if (cancelled) {
@@ -7181,16 +7284,52 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         level: "warn",
         message: "run cancelled",
       });
-      await releaseIssueExecutionAndPromote(cancelled);
+      await releaseIssueExecutionAndPromote(cancelled, { suppressContinuationRecovery: userInitiated });
     }
 
     runningProcesses.delete(run.id);
     await finalizeAgentStatus(run.agentId, "cancelled");
+
+    if (userInitiated) {
+      // Drain any queued timer-sourced runs so they don't immediately promote
+      // and re-start the agent. Non-timer queued runs (e.g. comment wakeups)
+      // are left intact and will be picked up by startNextQueuedRunForAgent below.
+      const queuedTimerRuns = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.status, "queued"),
+          eq(heartbeatRuns.invocationSource, "timer"),
+        ));
+      for (const timerRun of queuedTimerRuns) {
+        const cancelledTimerRun = await setRunStatus(timerRun.id, "cancelled", {
+          finishedAt: new Date(),
+          error: "Cancelled: user cancelled the active run",
+          errorCode: "cancelled",
+        });
+        await setWakeupStatus(timerRun.wakeupRequestId, "cancelled", {
+          finishedAt: new Date(),
+          error: "Cancelled: user cancelled the active run",
+        });
+        if (cancelledTimerRun) {
+          await appendRunEvent(cancelledTimerRun, 1, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: "run cancelled",
+          });
+        }
+      }
+    }
+
     await startNextQueuedRunForAgent(run.agentId);
     return cancelled;
   }
 
-  async function cancelActiveForAgentInternal(agentId: string, reason = "Cancelled due to agent pause") {
+  async function cancelActiveForAgentInternal(agentId: string, reason?: string, cancelSource?: CancelSource) {
+    const resolvedReason = reason ?? (cancelSource === "user_initiated" ? "Cancelled by user" : "Cancelled due to agent pause");
+    const userInitiated = cancelSource === "user_initiated";
     const agent = await getAgent(agentId);
     const runs = await db
       .select()
@@ -7198,22 +7337,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(and(eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES])));
 
     for (const run of runs) {
-      await setRunStatus(run.id, "cancelled", {
+      const cancelled = await setRunStatus(run.id, "cancelled", {
         finishedAt: new Date(),
-        error: reason,
+        error: resolvedReason,
         errorCode: "cancelled",
+        ...(cancelSource ? { cancelSource } : {}),
         ...(agent ? {
           resultJson: mergeRunStopMetadataForAgent(agent, "cancelled", {
             resultJson: parseObject(run.resultJson),
             errorCode: "cancelled",
-            errorMessage: reason,
+            errorMessage: resolvedReason,
           }),
         } : {}),
       });
 
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
         finishedAt: new Date(),
-        error: reason,
+        error: resolvedReason,
       });
 
       const running = runningProcesses.get(run.id);
@@ -7230,7 +7370,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           processGroupId: run.processGroupId,
         });
       }
-      await releaseIssueExecutionAndPromote(run);
+      await releaseIssueExecutionAndPromote(cancelled ?? run, { suppressContinuationRecovery: userInitiated });
     }
 
     return runs.length;
@@ -7238,7 +7378,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function cancelBudgetScopeWork(scope: BudgetEnforcementScope) {
     if (scope.scopeType === "agent") {
-      await cancelActiveForAgentInternal(scope.scopeId, "Cancelled due to budget pause");
+      await cancelActiveForAgentInternal(scope.scopeId, "Cancelled due to budget pause", "budget");
       await cancelPendingWakeupsForBudgetScope(scope);
       return;
     }
@@ -7258,10 +7398,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : await listProjectScopedRunIds(scope.companyId, scope.scopeId);
 
     for (const runId of runIds) {
-      await cancelRunInternal(runId, "Cancelled due to budget pause");
+      await cancelRunInternal(runId, "Cancelled due to budget pause", "budget");
     }
 
     await cancelPendingWakeupsForBudgetScope(scope);
+  }
+
+  async function countIssueAvailabilityForTimerAgent(agentId: string, companyId: string, agentNameKey: string) {
+    const assignedRows = await db
+      .select({ id: issues.id, executionAgentNameKey: issues.executionAgentNameKey })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.assigneeAgentId, agentId),
+        sql`${issues.status} not in ('done', 'cancelled')`,
+      ));
+
+    if (assignedRows.length === 0) return { totalAssigned: 0, available: 0 };
+
+    const available = assignedRows.filter(
+      (row) => row.executionAgentNameKey === null || row.executionAgentNameKey === agentNameKey,
+    ).length;
+
+    return { totalAssigned: assignedRows.length, available };
   }
 
   return {
@@ -7543,6 +7702,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
+        // If the agent has assigned issues but ALL of them are currently locked by
+        // another execution, skip this tick — there is no issue work for it to do
+        // and the run would immediately hit 409 on every checkout attempt.
+        // Pure-task agents (zero assigned issues) are unaffected: totalAssigned === 0
+        // falls through to the normal enqueue path.
+        const agentNameKey = normalizeAgentNameKey(agent.name);
+        if (!agentNameKey) continue;
+        const issueAvailability = await countIssueAvailabilityForTimerAgent(agent.id, agent.companyId, agentNameKey);
+        if (issueAvailability.totalAssigned > 0 && issueAvailability.available === 0) {
+          logger.debug(
+            { agentId: agent.id, totalAssigned: issueAvailability.totalAssigned },
+            "timer tick skipped: agent has assigned issues, all owned by other executions",
+          );
+          skipped += 1;
+          continue;
+        }
+
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
@@ -7562,9 +7738,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { checked, enqueued, skipped };
     },
 
-    cancelRun: (runId: string) => cancelRunInternal(runId),
+    cancelRun: (runId: string, cancelSource?: CancelSource) => cancelRunInternal(runId, undefined, cancelSource),
 
-    cancelActiveForAgent: (agentId: string) => cancelActiveForAgentInternal(agentId),
+    cancelActiveForAgent: (agentId: string, cancelSource: CancelSource = "user_initiated") =>
+      cancelActiveForAgentInternal(agentId, undefined, cancelSource),
 
     cancelBudgetScopeWork,
 

@@ -14,6 +14,7 @@ const payload = {
   prompt: fs.readFileSync(0, "utf8"),
   codexHome: process.env.CODEX_HOME || null,
   paperclipWakePayloadJson: process.env.PAPERCLIP_WAKE_PAYLOAD_JSON || null,
+  paperclipApiUrl: process.env.PAPERCLIP_API_URL || null,
   paperclipEnvKeys: Object.keys(process.env)
     .filter((key) => key.startsWith("PAPERCLIP_"))
     .sort(),
@@ -43,6 +44,7 @@ type CapturePayload = {
   prompt: string;
   codexHome: string | null;
   paperclipWakePayloadJson: string | null;
+  paperclipApiUrl: string | null;
   paperclipEnvKeys: string[];
 };
 
@@ -374,6 +376,59 @@ describe("codex execute", () => {
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses runtime primary URL for PAPERCLIP_API_URL in local heartbeats", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-api-url-"));
+    const workspace = path.join(root, "workspace");
+    await fs.mkdir(workspace, { recursive: true });
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipApiUrl = process.env.PAPERCLIP_API_URL;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_API_URL = "http://stale-host:3100";
+
+    let invocationEnv: Record<string, string> = {};
+    try {
+      const result = await execute({
+        runId: "run-local-api-url",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: "node",
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {
+          paperclipRuntimePrimaryUrl: "http://127.0.0.1:4310",
+        },
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+        onMeta: async (meta) => {
+          invocationEnv = meta.env ?? {};
+        },
+      });
+
+      expect(result.exitCode).not.toBe(0);
+      expect(invocationEnv.PAPERCLIP_API_URL).toBe("http://127.0.0.1:4310");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
+      else process.env.PAPERCLIP_API_URL = previousPaperclipApiUrl;
       await fs.rm(root, { recursive: true, force: true });
     }
   });

@@ -63,6 +63,7 @@ import {
   assertBoardOrgAccess,
   assertCompanyAccess,
   assertInstanceAdmin,
+  assertPluginToolAccess,
   getActorInfo,
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
@@ -589,13 +590,15 @@ export function pluginRoutes(
       return '"runContext.runId" does not belong to "runContext.agentId"';
     }
 
-    const [project] = await db
-      .select({ companyId: projects.companyId })
-      .from(projects)
-      .where(eq(projects.id, runContext.projectId))
-      .limit(1);
-    if (!project || project.companyId !== runContext.companyId) {
-      return '"runContext.projectId" does not belong to "runContext.companyId"';
+    if (runContext.projectId) {
+      const [project] = await db
+        .select({ companyId: projects.companyId })
+        .from(projects)
+        .where(eq(projects.id, runContext.projectId))
+        .limit(1);
+      if (!project || project.companyId !== runContext.companyId) {
+        return '"runContext.projectId" does not belong to "runContext.companyId"';
+      }
     }
 
     return null;
@@ -727,7 +730,7 @@ export function pluginRoutes(
    * Errors: 501 if tool dispatcher is not configured
    */
   router.get("/plugins/tools", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertPluginToolAccess(req);
 
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
@@ -761,7 +764,7 @@ export function pluginRoutes(
    * - 502 if the plugin worker is unavailable or the RPC call fails
    */
   router.post("/plugins/tools/execute", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertPluginToolAccess(req);
 
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
@@ -787,11 +790,15 @@ export function pluginRoutes(
       return;
     }
 
-    if (!runContext.agentId || !runContext.runId || !runContext.companyId || !runContext.projectId) {
+    if (!runContext.agentId || !runContext.runId || !runContext.companyId) {
       res.status(400).json({
-        error: '"runContext" must include agentId, runId, companyId, and projectId',
+        error: '"runContext" must include agentId, runId, and companyId',
       });
       return;
+    }
+
+    if (req.actor.type === "agent" && req.actor.agentId !== runContext.agentId) {
+      throw forbidden('"runContext.agentId" does not match the calling agent');
     }
 
     assertCompanyAccess(req, runContext.companyId);
@@ -801,9 +808,16 @@ export function pluginRoutes(
       return;
     }
 
-    // Verify the tool exists
+    // Verify the tool exists. When the caller is an agent, treat
+    // exposeToAgents=false tools as if they don't exist — preserves
+    // the dispatcher invariant that an agent can't see what it can't
+    // call.
     const registeredTool = toolDeps.toolDispatcher.getTool(tool);
     if (!registeredTool) {
+      res.status(404).json({ error: `Tool "${tool}" not found` });
+      return;
+    }
+    if (req.actor.type === "agent" && registeredTool.exposeToAgents === false) {
       res.status(404).json({ error: `Tool "${tool}" not found` });
       return;
     }

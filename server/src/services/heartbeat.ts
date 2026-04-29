@@ -6786,6 +6786,27 @@ export function heartbeatService(db: Db) {
         };
       }
 
+      // Don't enqueue recovery if there's already a pending request_confirmation —
+      // the agent intentionally stopped to wait for human approval. The confirmation
+      // acceptance will wake it when ready.
+      const hasPendingConfirmation = await tx
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.kind, "request_confirmation"),
+            eq(issueThreadInteractions.status, "pending"),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (hasPendingConfirmation) {
+        return { kind: "released" as const };
+      }
+
       const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
       const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
       const recoverySource =

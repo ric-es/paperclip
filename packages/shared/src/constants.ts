@@ -218,6 +218,24 @@ export type IssueExecutionStageType = (typeof ISSUE_EXECUTION_STAGE_TYPES)[numbe
 export const ISSUE_EXECUTION_STATE_STATUSES = ["idle", "pending", "changes_requested", "completed"] as const;
 export type IssueExecutionStateStatus = (typeof ISSUE_EXECUTION_STATE_STATUSES)[number];
 
+export const ISSUE_EXECUTION_PROVENANCE_HANDOFF_ROLES = [
+  "follow_up",
+  "review",
+  "qa",
+  "release",
+] as const;
+export type IssueExecutionProvenanceHandoffRole = (typeof ISSUE_EXECUTION_PROVENANCE_HANDOFF_ROLES)[number];
+
+export const ISSUE_EXECUTION_PROVENANCE_READINESS_CODES = [
+  "ready",
+  "missing_source_issue",
+  "missing_source_workspace",
+  "workspace_mismatch",
+  "missing_compare_target",
+  "workspace_archived",
+] as const;
+export type IssueExecutionProvenanceReadinessCode = (typeof ISSUE_EXECUTION_PROVENANCE_READINESS_CODES)[number];
+
 export const ISSUE_EXECUTION_DECISION_OUTCOMES = ["approved", "changes_requested"] as const;
 export type IssueExecutionDecisionOutcome = (typeof ISSUE_EXECUTION_DECISION_OUTCOMES)[number];
 

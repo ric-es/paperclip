@@ -38,6 +38,7 @@ const toastState = vi.hoisted(() => ({
 }));
 
 const mockIssuesApi = vi.hoisted(() => ({
+  list: vi.fn(),
   create: vi.fn(),
   upsertDocument: vi.fn(),
   uploadAttachment: vi.fn(),
@@ -250,6 +251,7 @@ describe("NewIssueDialog", () => {
     dialogState.newIssueDefaults = {};
     dialogState.closeNewIssue.mockReset();
     toastState.pushToast.mockReset();
+    mockIssuesApi.list.mockReset();
     mockIssuesApi.create.mockReset();
     mockIssuesApi.upsertDocument.mockReset();
     mockIssuesApi.uploadAttachment.mockReset();
@@ -268,6 +270,7 @@ describe("NewIssueDialog", () => {
     mockAuthApi.getSession.mockResolvedValue({ user: { id: "user-1" } });
     mockAssetsApi.uploadImage.mockResolvedValue({ contentPath: "/uploads/asset.png" });
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
+    mockIssuesApi.list.mockResolvedValue([]);
     mockIssuesApi.create.mockResolvedValue({
       id: "issue-2",
       companyId: "company-1",
@@ -365,6 +368,8 @@ describe("NewIssueDialog", () => {
         parentId: "issue-1",
         goalId: "goal-1",
         projectId: "project-1",
+        inheritExecutionWorkspaceFromIssueId: "issue-1",
+        executionProvenance: { handoffRole: "follow_up" },
         executionWorkspaceId: "workspace-1",
       }),
     );
@@ -523,6 +528,7 @@ describe("NewIssueDialog", () => {
       projectId: "project-1",
       executionWorkspaceId: "workspace-1",
       parentExecutionWorkspaceLabel: "Parent workspace",
+      sameCodeChangeSourceIssueId: "",
       goalId: "goal-1",
     };
 

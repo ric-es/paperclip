@@ -151,7 +151,10 @@ describe("gemini remote execution", () => {
       expect.stringContaining(".gemini/skills"),
       expect.anything(),
     );
-    const call = runChildProcess.mock.calls[0] as unknown as
+    const execCallIndex = (runChildProcess.mock.calls as unknown as unknown[][]).findIndex(
+      (c) => Array.isArray(c[2]) && (c[2] as string[]).includes("--output-format"),
+    );
+    const call = runChildProcess.mock.calls[execCallIndex] as unknown as
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
     expect(call?.[3].env.PAPERCLIP_API_URL).toBe("http://198.51.100.10:3102");
@@ -214,7 +217,10 @@ describe("gemini remote execution", () => {
       onLog: async () => {},
     });
 
-    const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
+    const execCallIndex = (runChildProcess.mock.calls as unknown as unknown[][]).findIndex(
+      (c) => Array.isArray(c[2]) && (c[2] as string[]).includes("--output-format"),
+    );
+    const call = runChildProcess.mock.calls[execCallIndex] as unknown as [string, string, string[]] | undefined;
     expect(call?.[2]).toContain("--resume");
     expect(call?.[2]).toContain("session-123");
   });

@@ -9,8 +9,9 @@ function safeJsonParse(text: string): unknown {
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  return value as Record<string, unknown>;
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function asString(value: unknown, fallback = ""): string {
@@ -18,12 +19,13 @@ function asString(value: unknown, fallback = ""): string {
 }
 
 function asNumber(value: unknown, fallback = 0): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isNaN(n) ? fallback : n;
 }
 
 function stringifyUnknown(value: unknown): string {
   if (typeof value === "string") return value;
-  if (value === null || value === undefined) return "";
+  if (value === undefined || value === null) return "";
   try {
     return JSON.stringify(value, null, 2);
   } catch {
@@ -34,44 +36,10 @@ function stringifyUnknown(value: unknown): string {
 function errorText(value: unknown): string {
   if (typeof value === "string") return value;
   const rec = asRecord(value);
-  if (!rec) return "";
-  const msg =
-    (typeof rec.message === "string" && rec.message) ||
-    (typeof rec.error === "string" && rec.error) ||
-    (typeof rec.code === "string" && rec.code) ||
-    "";
-  if (msg) return msg;
-  try {
-    return JSON.stringify(rec);
-  } catch {
-    return "";
+  if (rec) {
+    return asString(rec.message) || asString(rec.error) || asString(rec.code) || stringifyUnknown(rec);
   }
-}
-
-function collectTextEntries(messageRaw: unknown, ts: string, kind: "assistant" | "user"): TranscriptEntry[] {
-  if (typeof messageRaw === "string") {
-    const text = messageRaw.trim();
-    return text ? [{ kind, ts, text }] : [];
-  }
-
-  const message = asRecord(messageRaw);
-  if (!message) return [];
-
-  const entries: TranscriptEntry[] = [];
-  const directText = asString(message.text).trim();
-  if (directText) entries.push({ kind, ts, text: directText });
-
-  const content = Array.isArray(message.content) ? message.content : [];
-  for (const partRaw of content) {
-    const part = asRecord(partRaw);
-    if (!part) continue;
-    const type = asString(part.type).trim();
-    if (type !== "output_text" && type !== "text" && type !== "content") continue;
-    const text = asString(part.text).trim() || asString(part.content).trim();
-    if (text) entries.push({ kind, ts, text });
-  }
-
-  return entries;
+  return stringifyUnknown(value);
 }
 
 function parseAssistantMessage(messageRaw: unknown, ts: string): TranscriptEntry[] {
@@ -79,7 +47,6 @@ function parseAssistantMessage(messageRaw: unknown, ts: string): TranscriptEntry
     const text = messageRaw.trim();
     return text ? [{ kind: "assistant", ts, text }] : [];
   }
-
   const message = asRecord(messageRaw);
   if (!message) return [];
 
@@ -87,25 +54,25 @@ function parseAssistantMessage(messageRaw: unknown, ts: string): TranscriptEntry
   const directText = asString(message.text).trim();
   if (directText) entries.push({ kind: "assistant", ts, text: directText });
 
+  if (typeof message.content === "string") {
+    const text = message.content.trim();
+    if (text) entries.push({ kind: "assistant", ts, text });
+    return entries;
+  }
+
   const content = Array.isArray(message.content) ? message.content : [];
   for (const partRaw of content) {
     const part = asRecord(partRaw);
     if (!part) continue;
-    const type = asString(part.type).trim();
 
+    const type = asString(part.type);
     if (type === "output_text" || type === "text" || type === "content") {
-      const text = asString(part.text).trim() || asString(part.content).trim();
+      const text = (asString(part.text) || asString(part.content)).trim();
       if (text) entries.push({ kind: "assistant", ts, text });
-      continue;
-    }
-
-    if (type === "thinking") {
+    } else if (type === "thought" || type === "thinking") {
       const text = asString(part.text).trim();
       if (text) entries.push({ kind: "thinking", ts, text });
-      continue;
-    }
-
-    if (type === "tool_call") {
+    } else if (type === "tool_call") {
       const name = asString(part.name, asString(part.tool, "tool"));
       entries.push({
         kind: "tool_call",
@@ -113,10 +80,7 @@ function parseAssistantMessage(messageRaw: unknown, ts: string): TranscriptEntry
         name,
         input: part.input ?? part.arguments ?? part.args ?? {},
       });
-      continue;
-    }
-
-    if (type === "tool_result" || type === "tool_response") {
+    } else if (type === "tool_result" || type === "tool_response") {
       const toolUseId =
         asString(part.tool_use_id) ||
         asString(part.toolUseId) ||
@@ -142,11 +106,37 @@ function parseAssistantMessage(messageRaw: unknown, ts: string): TranscriptEntry
   return entries;
 }
 
+function collectTextEntries(messageRaw: unknown, ts: string, kind: "user" | "assistant"): TranscriptEntry[] {
+  if (typeof messageRaw === "string") {
+    const text = messageRaw.trim();
+    return text ? [{ kind, ts, text }] : [];
+  }
+  const message = asRecord(messageRaw);
+  if (!message) return [];
+
+  const entries: TranscriptEntry[] = [];
+  const directText = asString(message.text).trim();
+  if (directText) entries.push({ kind, ts, text: directText });
+
+  const content = Array.isArray(message.content)
+    ? message.content
+    : typeof message.content === "string"
+      ? [{ text: message.content }]
+      : [];
+  for (const partRaw of content) {
+    const part = asRecord(partRaw);
+    const text = (asString(part?.text) || asString(part?.content)).trim();
+    if (text) entries.push({ kind, ts, text });
+  }
+
+  return entries;
+}
+
 function parseTopLevelToolEvent(parsed: Record<string, unknown>, ts: string): TranscriptEntry[] {
   const subtype = asString(parsed.subtype).trim().toLowerCase();
-  const callId = asString(parsed.call_id, asString(parsed.callId, asString(parsed.id, "tool_call")));
+  const callId = asString(parsed.call_id) || asString(parsed.callId) || asString(parsed.id);
   const toolCall = asRecord(parsed.tool_call ?? parsed.toolCall);
-  if (!toolCall) {
+  if (!callId || !toolCall) {
     return [{ kind: "system", ts, text: `tool_call${subtype ? ` (${subtype})` : ""}` }];
   }
 
@@ -154,6 +144,7 @@ function parseTopLevelToolEvent(parsed: Record<string, unknown>, ts: string): Tr
   if (!toolName) {
     return [{ kind: "system", ts, text: `tool_call${subtype ? ` (${subtype})` : ""}` }];
   }
+  
   const payload = asRecord(toolCall[toolName]) ?? {};
 
   if (subtype === "started" || subtype === "start") {
@@ -161,6 +152,7 @@ function parseTopLevelToolEvent(parsed: Record<string, unknown>, ts: string): Tr
       kind: "tool_call",
       ts,
       name: toolName,
+      toolUseId: callId,
       input: payload.args ?? payload.input ?? payload.arguments ?? payload,
     }];
   }
@@ -184,13 +176,14 @@ function parseTopLevelToolEvent(parsed: Record<string, unknown>, ts: string): Tr
   return [{ kind: "system", ts, text: `tool_call${subtype ? ` (${subtype})` : ""}: ${toolName}` }];
 }
 
-function readSessionId(parsed: Record<string, unknown>): string {
+function readSessionId(parsed: Record<string, unknown>) {
   return (
-    asString(parsed.session_id) ||
-    asString(parsed.sessionId) ||
-    asString(parsed.sessionID) ||
-    asString(parsed.checkpoint_id) ||
-    asString(parsed.thread_id)
+    asString(parsed.session_id).trim() ||
+    asString(parsed.sessionId).trim() ||
+    asString(parsed.sessionID).trim() ||
+    asString(parsed.checkpoint_id).trim() ||
+    asString(parsed.thread_id).trim() ||
+    ""
   );
 }
 
@@ -216,34 +209,44 @@ export function parseGeminiStdoutLine(line: string, ts: string): TranscriptEntry
 
   const type = asString(parsed.type);
 
-  if (type === "system") {
-    const subtype = asString(parsed.subtype);
-    if (subtype === "init") {
-      const sessionId = readSessionId(parsed);
-      return [{ kind: "init", ts, model: asString(parsed.model, "gemini"), sessionId }];
+  // Modern Top-Level Event Types
+  if (type === "init") {
+    const sessionId = readSessionId(parsed);
+    return [{ kind: "init", ts, model: asString(parsed.model, "gemini"), sessionId }];
+  }
+
+  if (type === "message") {
+    const role = asString(parsed.role).trim().toLowerCase();
+    if (role === "assistant") {
+      return parseAssistantMessage(parsed, ts);
     }
-    if (subtype === "error") {
-      const text = errorText(parsed.error ?? parsed.message ?? parsed.detail);
-      return [{ kind: "stderr", ts, text: text || "error" }];
+    if (role === "user") {
+      return collectTextEntries(parsed, ts, "user");
     }
-    return [{ kind: "system", ts, text: `system: ${subtype || "event"}` }];
+    return []; // Suppress unrecognized role
   }
 
-  if (type === "assistant") {
-    return parseAssistantMessage(parsed.message, ts);
+  if (type === "tool_use") {
+    const toolUseId = asString(parsed.tool_id) || asString(parsed.toolUseId) || asString(parsed.call_id) || asString(parsed.id);
+    return [{
+      kind: "tool_call",
+      ts,
+      name: asString(parsed.tool_name),
+      toolUseId,
+      input: parsed.parameters ?? parsed.input ?? parsed.arguments ?? {},
+    }];
   }
 
-  if (type === "user") {
-    return collectTextEntries(parsed.message, ts, "user");
-  }
-
-  if (type === "thinking") {
-    const text = asString(parsed.text).trim() || asString(asRecord(parsed.delta)?.text).trim();
-    return text ? [{ kind: "thinking", ts, text }] : [];
-  }
-
-  if (type === "tool_call") {
-    return parseTopLevelToolEvent(parsed, ts);
+  if (type === "tool_result") {
+    const toolUseId = asString(parsed.tool_id) || asString(parsed.toolUseId) || asString(parsed.call_id) || asString(parsed.id);
+    if (!toolUseId) return [];
+    return [{
+      kind: "tool_result",
+      ts,
+      toolUseId,
+      content: stringifyUnknown(parsed.result ?? parsed.output ?? parsed.content),
+      isError: parsed.status === "error",
+    }];
   }
 
   if (type === "result") {
@@ -265,10 +268,42 @@ export function parseGeminiStdoutLine(line: string, ts: string): TranscriptEntry
     }];
   }
 
+  if (type === "thinking") {
+    const text = asString(parsed.text).trim() || asString(asRecord(parsed.delta)?.text).trim();
+    return text ? [{ kind: "thinking", ts, text }] : [];
+  }
+
   if (type === "error") {
     const text = errorText(parsed.error ?? parsed.message ?? parsed.detail);
     return [{ kind: "stderr", ts, text: text || "error" }];
   }
 
+  // Legacy / System Subtype Fallbacks
+  if (type === "system") {
+    const subtype = asString(parsed.subtype);
+    if (subtype === "init") {
+      const sessionId = readSessionId(parsed);
+      return [{ kind: "init", ts, model: asString(parsed.model, "gemini"), sessionId }];
+    }
+    if (subtype === "error") {
+      const text = errorText(parsed.error ?? parsed.message ?? parsed.detail);
+      return [{ kind: "stderr", ts, text: text || "error" }];
+    }
+    return [{ kind: "system", ts, text: `system: ${subtype || "event"}` }];
+  }
+
+  if (type === "assistant") {
+    return parseAssistantMessage(parsed.message, ts);
+  }
+
+  if (type === "user") {
+    return collectTextEntries(parsed.message, ts, "user");
+  }
+
+  if (type === "tool_call") {
+    return parseTopLevelToolEvent(parsed, ts);
+  }
+
   return [{ kind: "stdout", ts, text: line }];
 }
+

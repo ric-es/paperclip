@@ -29,6 +29,7 @@ import {
   issueLabels,
   issueRelations,
   issues,
+  issueThreadInteractions,
   issueWorkProducts,
   labels,
   projects,
@@ -4084,6 +4085,24 @@ export function heartbeatService(db: Db) {
     return Boolean(run || deferredWake);
   }
 
+  async function issueHasPendingRequestConfirmation(companyId: string, issueId: string) {
+    const row = await db
+      .select({ id: issueThreadInteractions.id })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, companyId),
+          eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.kind, "request_confirmation"),
+          eq(issueThreadInteractions.status, "pending"),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    return Boolean(row);
+  }
+
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -4571,6 +4590,11 @@ export function heartbeatService(db: Db) {
       }
 
       if (await hasActiveExecutionPath(issue.companyId, issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      if (await issueHasPendingRequestConfirmation(issue.companyId, issue.id)) {
         result.skipped += 1;
         continue;
       }

@@ -63,6 +63,14 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function readTimeoutStream(error: TimeoutError, key: "stdout" | "stderr"): string {
+  const direct = (error as unknown as Record<string, unknown>)[key];
+  if (typeof direct === "string" && direct.length > 0) return direct;
+  const nested = (error as { result?: Record<string, unknown> }).result?.[key];
+  if (typeof nested === "string") return nested;
+  return typeof direct === "string" ? direct : "";
+}
+
 async function ensureSandboxWorkspace(sandbox: Sandbox, remoteCwd: string): Promise<void> {
   await sandbox.commands.run(`mkdir -p ${shellQuote(remoteCwd)}`);
 }
@@ -316,12 +324,15 @@ const plugin = definePlugin({
 
     const config = parseDriverConfig(params.config);
     const sandbox = await connectSandbox(config, params.lease.providerLeaseId);
-    const started = await sandbox.commands.run(buildCommandLine(params.command, params.args), {
+    const command = buildCommandLine(params.command, params.args);
+    const timeoutMs = params.timeoutMs ?? config.timeoutMs;
+
+    const started = await sandbox.commands.run(command, {
       background: true,
       stdin: params.stdin != null,
       cwd: params.cwd,
       envs: params.env,
-      timeoutMs: params.timeoutMs ?? config.timeoutMs,
+      timeoutMs,
     }) as Awaited<ReturnType<Sandbox["commands"]["run"]>> & {
       pid: number;
       stdout: string;
@@ -356,11 +367,21 @@ const plugin = definePlugin({
       }
       if (error instanceof TimeoutError) {
         const timeoutError = error as TimeoutError;
+        const stdout = readTimeoutStream(timeoutError, "stdout") || started.stdout;
+        const stderrOutput = readTimeoutStream(timeoutError, "stderr") || started.stderr;
+        const message = timeoutError.message.trim();
+        const stderr = stderrOutput.length > 0
+          ? message.length > 0 && !stderrOutput.includes(message)
+            ? `${stderrOutput}${stderrOutput.endsWith("\n") ? "" : "\n"}${message}\n`
+            : stderrOutput
+          : message.length > 0
+            ? `${message}\n`
+            : "";
         return {
           exitCode: null,
           timedOut: true,
-          stdout: started.stdout,
-          stderr: started.stderr || `${timeoutError.message}\n`,
+          stdout,
+          stderr,
         };
       }
       throw error;

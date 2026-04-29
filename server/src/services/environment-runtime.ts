@@ -36,6 +36,7 @@ import {
   executePluginEnvironmentCommand,
   realizePluginEnvironmentWorkspace,
   resolvePluginSandboxProviderDriverByKey,
+  resolvePluginExecuteRpcTimeoutMs,
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
@@ -565,11 +566,12 @@ function createSandboxEnvironmentDriver(
             lease: input.lease,
             provider: providerKey,
           });
+          const sanitizedConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
           return await pluginWorkerManager.call(pluginId, "environmentExecute", {
             driverKey: providerKey,
             companyId: input.lease.companyId,
             environmentId: input.environment.id,
-            config: stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig),
+            config: sanitizedConfig,
             lease: {
               providerLeaseId: input.lease.providerLeaseId,
               metadata: input.lease.metadata ?? undefined,
@@ -581,7 +583,10 @@ function createSandboxEnvironmentDriver(
             env: input.env,
             stdin: input.stdin,
             timeoutMs: input.timeoutMs,
-          });
+          }, resolvePluginExecuteRpcTimeoutMs({
+            requestedTimeoutMs: input.timeoutMs,
+            config: sanitizedConfig,
+          }));
         }
       }
       throw new Error("Sandbox driver does not support direct command execution for built-in providers.");

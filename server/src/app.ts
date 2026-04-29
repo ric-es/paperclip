@@ -228,6 +228,7 @@ export async function createApp(
     workerManager,
     lifecycleManager: lifecycle,
     db,
+    eventBus,
   });
   const jobCoordinator = createPluginJobCoordinator({
     db,

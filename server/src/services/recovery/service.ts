@@ -1702,7 +1702,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
-        result.skipped += 1;
+        // in_progress with no execution history means the issue was set to in_progress
+        // programmatically (e.g. by an agent creating a sub-issue) without ever going
+        // through a dispatch run. Treat it like an unstarted todo: dispatch it fresh
+        // rather than silently skipping it, so it doesn't get permanently stranded.
+        if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
+          result.skipped += 1;
+          continue;
+        }
+
+        if (await isInvocationBudgetBlocked(issue, agentId)) {
+          result.skipped += 1;
+          continue;
+        }
+
+        const queued = await enqueueInitialAssignedTodoDispatch(issue, agentId);
+        if (queued) {
+          result.assignmentDispatched += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
         continue;
       }
       if (isSuccessfulInProgressContinuationRun(latestRun)) {

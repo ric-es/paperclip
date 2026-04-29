@@ -8,8 +8,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
   authUsers,
+  companyMemberships,
   companies,
   createDb,
+  instanceUserRoles,
   issueComments,
   issues,
   projects,
@@ -596,6 +598,174 @@ describe("worktree helpers", () => {
         }
       } finally {
         process.chdir(originalCwd);
+        await sourceDb.cleanup();
+        fs.rmSync(tempRoot, { recursive: true, force: true });
+      }
+    },
+    30000,
+  );
+
+  itEmbeddedPostgres(
+    "uses the current authenticated DATABASE_URL for full-seed worktree restores even when config still says embedded-postgres",
+    async () => {
+      const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-auth-full-seed-"));
+      const worktreeRoot = path.join(tempRoot, "PAP-999-auth-full-seed");
+      const sourceHome = path.join(tempRoot, "source-home");
+      const sourceConfigDir = path.join(sourceHome, "instances", "source");
+      const sourceConfigPath = path.join(sourceConfigDir, "config.json");
+      const sourceEnvPath = path.join(sourceConfigDir, ".env");
+      const sourceKeyPath = path.join(sourceConfigDir, "secrets", "master.key");
+      const worktreeHome = path.join(tempRoot, ".paperclip-worktrees");
+      const originalCwd = process.cwd();
+      const originalDatabaseUrl = process.env.DATABASE_URL;
+      const originalPaperclipConfig = process.env.PAPERCLIP_CONFIG;
+      const sourceDb = await startEmbeddedPostgresTestDatabase("paperclip-worktree-auth-full-source-");
+
+      try {
+        const sourceDbClient = createDb(sourceDb.connectionString);
+        const companyId = randomUUID();
+        const agentId = randomUUID();
+        const issueId = randomUUID();
+
+        await sourceDbClient.insert(authUsers).values({
+          id: "user-existing",
+          email: "existing@paperclip.ing",
+          name: "Existing User",
+          emailVerified: true,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+        await sourceDbClient.insert(instanceUserRoles).values({
+          userId: "user-existing",
+          role: "instance_admin",
+        });
+        await sourceDbClient.insert(companies).values({
+          id: companyId,
+          name: "Source Company",
+          issuePrefix: "SRC",
+          requireBoardApprovalForNewAgents: false,
+        });
+        await sourceDbClient.insert(companyMemberships).values({
+          companyId,
+          principalType: "user",
+          principalId: "user-existing",
+          status: "active",
+          membershipRole: "owner",
+        });
+        await sourceDbClient.insert(agents).values({
+          id: agentId,
+          companyId,
+          name: "Existing Agent",
+          role: "engineer",
+          status: "running",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: {
+            heartbeat: { enabled: true, intervalSec: 60 },
+          },
+          permissions: {},
+        });
+        await sourceDbClient.insert(issues).values({
+          id: issueId,
+          companyId,
+          title: "Existing work item",
+          status: "in_progress",
+          priority: "medium",
+          assigneeAgentId: agentId,
+          issueNumber: 1,
+          identifier: "SRC-1",
+          executionAgentNameKey: "existingagent",
+          executionLockedAt: new Date("2026-04-18T00:00:00.000Z"),
+        });
+
+        fs.mkdirSync(path.dirname(sourceKeyPath), { recursive: true });
+        fs.mkdirSync(worktreeRoot, { recursive: true });
+
+        const sourceConfig = buildSourceConfig();
+        sourceConfig.database = {
+          mode: "embedded-postgres",
+          embeddedPostgresDataDir: path.join(sourceConfigDir, "db"),
+          embeddedPostgresPort: 54329,
+          backup: {
+            enabled: true,
+            intervalMinutes: 60,
+            retentionDays: 30,
+            dir: path.join(sourceConfigDir, "backups"),
+          },
+        };
+        sourceConfig.logging.logDir = path.join(sourceConfigDir, "logs");
+        sourceConfig.storage.localDisk.baseDir = path.join(sourceConfigDir, "storage");
+        sourceConfig.secrets.localEncrypted.keyFilePath = sourceKeyPath;
+
+        fs.writeFileSync(sourceConfigPath, JSON.stringify(sourceConfig, null, 2) + "\n", "utf8");
+        fs.writeFileSync(sourceEnvPath, "", "utf8");
+        fs.writeFileSync(sourceKeyPath, "source-master-key", "utf8");
+
+        process.env.PAPERCLIP_CONFIG = sourceConfigPath;
+        process.env.DATABASE_URL = sourceDb.connectionString;
+
+        process.chdir(worktreeRoot);
+        await worktreeInitCommand({
+          name: "PAP-999-auth-full-seed",
+          home: worktreeHome,
+          fromConfig: sourceConfigPath,
+          force: true,
+          seedMode: "full",
+        });
+
+        const targetConfig = JSON.parse(
+          fs.readFileSync(path.join(worktreeRoot, ".paperclip", "config.json"), "utf8"),
+        ) as PaperclipConfig;
+        const { default: EmbeddedPostgres } = await import("embedded-postgres");
+        const targetPg = new EmbeddedPostgres({
+          databaseDir: targetConfig.database.embeddedPostgresDataDir,
+          user: "paperclip",
+          password: "paperclip",
+          port: targetConfig.database.embeddedPostgresPort,
+          persistent: true,
+          initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+          onLog: () => {},
+          onError: () => {},
+        });
+
+        await targetPg.start();
+        try {
+          const targetDb = createDb(
+            `postgres://paperclip:paperclip@127.0.0.1:${targetConfig.database.embeddedPostgresPort}/paperclip`,
+          );
+          const seededCompanies = await targetDb.select().from(companies);
+          const seededAgents = await targetDb.select().from(agents);
+          const seededIssues = await targetDb.select().from(issues);
+          const seededMemberships = await targetDb.select().from(companyMemberships);
+          const seededRoles = await targetDb.select().from(instanceUserRoles);
+
+          expect(seededCompanies).toHaveLength(1);
+          expect(seededAgents).toHaveLength(1);
+          expect(seededIssues).toHaveLength(1);
+          expect(seededMemberships).toHaveLength(1);
+          expect(seededRoles).toHaveLength(1);
+          expect(seededIssues[0]).toMatchObject({
+            id: issueId,
+            status: "blocked",
+            assigneeAgentId: null,
+          });
+        } finally {
+          await targetPg.stop();
+        }
+
+        expect(fs.existsSync(path.join(sourceConfig.database.embeddedPostgresDataDir, "PG_VERSION"))).toBe(false);
+      } finally {
+        process.chdir(originalCwd);
+        if (originalDatabaseUrl === undefined) {
+          delete process.env.DATABASE_URL;
+        } else {
+          process.env.DATABASE_URL = originalDatabaseUrl;
+        }
+        if (originalPaperclipConfig === undefined) {
+          delete process.env.PAPERCLIP_CONFIG;
+        } else {
+          process.env.PAPERCLIP_CONFIG = originalPaperclipConfig;
+        }
         await sourceDb.cleanup();
         fs.rmSync(tempRoot, { recursive: true, force: true });
       }

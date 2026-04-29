@@ -1049,9 +1049,6 @@ export function issueRoutes(
         ? req.query.wakeCommentId.trim()
         : null;
 
-    const currentExecutionWorkspacePromise = issue.executionWorkspaceId
-      ? executionWorkspacesSvc.getById(issue.executionWorkspaceId)
-      : Promise.resolve(null);
     const [
       { project, goal },
       ancestors,
@@ -1062,9 +1059,7 @@ export function issueRoutes(
       productivityReview,
       attachments,
       continuationSummary,
-      currentExecutionWorkspace,
-    ] =
-      await Promise.all([
+    ] = await Promise.all([
         resolveIssueProjectAndGoal(issue),
         svc.getAncestors(issue.id),
         svc.getCommentCursor(issue.id),
@@ -1074,8 +1069,16 @@ export function issueRoutes(
         svc.listProductivityReviews(issue.companyId, [issue.id]).then((map) => map.get(issue.id) ?? null),
         svc.listAttachments(issue.id),
         documentsSvc.getIssueDocumentByKey(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
-        currentExecutionWorkspacePromise,
       ]);
+
+    const currentExecutionWorkspace = await executionWorkspacesSvc.resolveSnapshotForIssue(
+      issue.companyId,
+      {
+        executionWorkspaceId: issue.executionWorkspaceId ?? null,
+        projectWorkspaceId: issue.projectWorkspaceId ?? null,
+      },
+      project?.primaryWorkspace?.id ?? null,
+    );
 
     res.json({
       issue: {
@@ -1090,6 +1093,8 @@ export function issueRoutes(
         projectId: issue.projectId,
         goalId: goal?.id ?? issue.goalId,
         parentId: issue.parentId,
+        projectWorkspaceId: issue.projectWorkspaceId ?? null,
+        executionWorkspaceId: issue.executionWorkspaceId ?? null,
         blockedBy: relations.blockedBy,
         blocks: relations.blocks,
         assigneeAgentId: issue.assigneeAgentId,
@@ -1179,9 +1184,14 @@ export function issueRoutes(
     const mentionedProjects = mentionedProjectIds.length > 0
       ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
       : [];
-    const currentExecutionWorkspace = issue.executionWorkspaceId
-      ? await executionWorkspacesSvc.getById(issue.executionWorkspaceId)
-      : null;
+    const currentExecutionWorkspace = await executionWorkspacesSvc.resolveSnapshotForIssue(
+      issue.companyId,
+      {
+        executionWorkspaceId: issue.executionWorkspaceId ?? null,
+        projectWorkspaceId: issue.projectWorkspaceId ?? null,
+      },
+      project?.primaryWorkspace?.id ?? null,
+    );
     const workProducts = await workProductsSvc.listForIssue(issue.id);
     res.json({
       ...issue,

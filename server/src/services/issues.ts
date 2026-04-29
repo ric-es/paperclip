@@ -29,6 +29,9 @@ import {
 } from "@paperclipai/db";
 import type {
   IssueBlockerAttention,
+  IssueExecutionProvenance,
+  IssueExecutionProvenanceInput,
+  IssueExecutionProvenanceReadiness,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
@@ -60,6 +63,7 @@ const ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE = 500;
 export const MAX_CHILD_ISSUES_CREATED_BY_HELPER = 25;
 const MAX_CHILD_COMPLETION_SUMMARIES = 20;
 const CHILD_COMPLETION_SUMMARY_BODY_MAX_CHARS = 500;
+const REVIEW_STYLE_PROVENANCE_ROLES = new Set<IssueExecutionProvenance["handoffRole"]>(["review", "qa", "release"]);
 function assertTransition(from: string, to: string) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
@@ -89,6 +93,74 @@ function readStringFromRecord(record: unknown, key: string) {
   if (!record || typeof record !== "object") return null;
   const value = (record as Record<string, unknown>)[key];
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function normalizeExecutionProvenanceInput(
+  value: IssueExecutionProvenanceInput | IssueExecutionProvenance | null | undefined,
+): IssueExecutionProvenanceInput | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  return {
+    handoffRole: value.handoffRole,
+    sourceIssueId: value.sourceIssueId ?? null,
+    sourceExecutionWorkspaceId: value.sourceExecutionWorkspaceId ?? null,
+    branchName: value.branchName ?? null,
+    baseRef: value.baseRef ?? null,
+    capturedAt: value.capturedAt ?? null,
+  };
+}
+
+function executionProvenanceExpected(
+  provenance: IssueExecutionProvenance,
+  sourceIssue?: ExecutionProvenanceSourceIssueRow | null,
+) {
+  return {
+    sourceIssueId: provenance.sourceIssueId,
+    sourceIssueIdentifier: sourceIssue?.identifier ?? null,
+    sourceIssueTitle: sourceIssue?.title ?? null,
+    sourceExecutionWorkspaceId: provenance.sourceExecutionWorkspaceId,
+    branchName: provenance.branchName,
+    baseRef: provenance.baseRef,
+  };
+}
+
+function executionProvenanceActual(
+  executionWorkspaceId: string | null,
+  workspace: ExecutionProvenanceWorkspaceRow | null,
+) {
+  if (!executionWorkspaceId && !workspace) return null;
+  return {
+    executionWorkspaceId: executionWorkspaceId ?? workspace?.id ?? null,
+    branchName: workspace?.branchName ?? null,
+    cwd: workspace?.cwd ?? null,
+    status: workspace?.status ?? null,
+  };
+}
+
+function buildExecutionProvenanceReadiness(
+  input: Omit<IssueExecutionProvenanceReadiness, "ready"> & { ready?: boolean },
+): IssueExecutionProvenanceReadiness {
+  return {
+    ready: input.ready ?? input.code === "ready",
+    code: input.code,
+    message: input.message,
+    expected: input.expected,
+    actual: input.actual,
+    recoverySteps: input.recoverySteps,
+  };
+}
+
+function isArchivedExecutionWorkspace(workspace: ExecutionProvenanceWorkspaceRow | null) {
+  if (!workspace) return false;
+  return workspace.status === "archived" || workspace.status === "cleanup_failed" || workspace.closedAt != null;
+}
+
+function executionProvenanceCompareTargetDrifted(
+  workspace: ExecutionProvenanceWorkspaceRow | null,
+  provenance: IssueExecutionProvenance,
+) {
+  if (!workspace) return false;
+  return workspace.branchName !== provenance.branchName || workspace.baseRef !== provenance.baseRef;
 }
 
 export interface IssueFilters {
@@ -151,10 +223,11 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
-type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
+type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "executionProvenance"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
+  executionProvenance?: IssueExecutionProvenanceInput | null;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -184,6 +257,30 @@ export type ChildIssueCompletionSummary = {
   assigneeUserId: string | null;
   updatedAt: Date;
   summary: string | null;
+};
+
+type ExecutionProvenanceIssueInput = Pick<
+  typeof issues.$inferSelect,
+  "companyId" | "executionWorkspaceId"
+> & {
+  executionProvenance?: IssueExecutionProvenance | null;
+};
+
+type ExecutionProvenanceSourceIssueRow = {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: string;
+  executionWorkspaceId: string | null;
+};
+
+type ExecutionProvenanceWorkspaceRow = {
+  id: string;
+  status: string;
+  branchName: string | null;
+  baseRef: string | null;
+  cwd: string | null;
+  closedAt: Date | null;
 };
 
 function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
@@ -1399,6 +1496,7 @@ const issueListSelect = {
   assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
   executionPolicy: sql<null>`null`,
   executionState: sql<null>`null`,
+  executionProvenance: issues.executionProvenance,
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
   executionWorkspaceSettings: sql<null>`null`,
@@ -1605,6 +1703,227 @@ async function blockedByMapForIssues(
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+
+  async function getExecutionProvenanceSourceIssue(
+    dbOrTx: DbReader,
+    companyId: string,
+    sourceIssueId: string,
+  ): Promise<ExecutionProvenanceSourceIssueRow | null> {
+    return dbOrTx
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        executionWorkspaceId: issues.executionWorkspaceId,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.id, sourceIssueId)))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function getExecutionProvenanceWorkspace(
+    dbOrTx: DbReader,
+    workspaceId: string,
+  ): Promise<ExecutionProvenanceWorkspaceRow | null> {
+    return dbOrTx
+      .select({
+        id: executionWorkspaces.id,
+        status: executionWorkspaces.status,
+        branchName: executionWorkspaces.branchName,
+        baseRef: executionWorkspaces.baseRef,
+        cwd: executionWorkspaces.cwd,
+        closedAt: executionWorkspaces.closedAt,
+      })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspaceId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function captureExecutionProvenance(
+    dbOrTx: DbReader,
+    input: {
+      companyId: string;
+      sourceIssueId: string;
+      handoffRole: IssueExecutionProvenance["handoffRole"];
+    },
+  ): Promise<IssueExecutionProvenance> {
+    const sourceIssue = await getExecutionProvenanceSourceIssue(dbOrTx, input.companyId, input.sourceIssueId);
+    if (!sourceIssue) {
+      throw unprocessable("Execution provenance source issue not found", {
+        sourceIssueId: input.sourceIssueId,
+      });
+    }
+    if (!sourceIssue.executionWorkspaceId) {
+      throw unprocessable("Same-code-change handoffs require a source issue with a live execution workspace", {
+        sourceIssueId: input.sourceIssueId,
+      });
+    }
+    const sourceWorkspace = await getExecutionProvenanceWorkspace(dbOrTx, sourceIssue.executionWorkspaceId);
+    if (!sourceWorkspace) {
+      throw unprocessable("Execution provenance source workspace not found", {
+        sourceIssueId: input.sourceIssueId,
+        sourceExecutionWorkspaceId: sourceIssue.executionWorkspaceId,
+      });
+    }
+    return {
+      handoffRole: input.handoffRole,
+      sourceIssueId: sourceIssue.id,
+      sourceExecutionWorkspaceId: sourceWorkspace.id,
+      branchName: sourceWorkspace.branchName,
+      baseRef: sourceWorkspace.baseRef,
+      capturedAt: new Date().toISOString(),
+    };
+  }
+
+  async function evaluateExecutionProvenanceReadinessForIssue(
+    dbOrTx: DbReader,
+    issue: ExecutionProvenanceIssueInput,
+  ): Promise<IssueExecutionProvenanceReadiness | null> {
+    const provenance = issue.executionProvenance ?? null;
+    if (!provenance) return null;
+
+    const sourceIssue = await getExecutionProvenanceSourceIssue(dbOrTx, issue.companyId, provenance.sourceIssueId);
+    const [
+      capturedSourceWorkspace,
+      currentSourceWorkspace,
+      actualWorkspace,
+    ] = await Promise.all([
+      getExecutionProvenanceWorkspace(dbOrTx, provenance.sourceExecutionWorkspaceId),
+      sourceIssue?.executionWorkspaceId
+        ? getExecutionProvenanceWorkspace(dbOrTx, sourceIssue.executionWorkspaceId)
+        : Promise.resolve(null),
+      issue.executionWorkspaceId ? getExecutionProvenanceWorkspace(dbOrTx, issue.executionWorkspaceId) : Promise.resolve(null),
+    ]);
+
+    const expected = executionProvenanceExpected(provenance, sourceIssue);
+    const actual = executionProvenanceActual(issue.executionWorkspaceId ?? null, actualWorkspace);
+
+    if (!sourceIssue) {
+      return buildExecutionProvenanceReadiness({
+        code: "missing_source_issue",
+        message: "The source implementation issue for this code-change handoff no longer exists.",
+        expected,
+        actual,
+        recoverySteps: [
+          "Point the handoff at the correct implementation issue before waking review, QA, or release.",
+          `Rebind the issue with \`inheritExecutionWorkspaceFromIssueId=${provenance.sourceIssueId}\` once the source issue exists again.`,
+        ],
+      });
+    }
+
+    if (!sourceIssue.executionWorkspaceId || !currentSourceWorkspace) {
+      return buildExecutionProvenanceReadiness({
+        code: "missing_source_workspace",
+        message: "The source implementation issue no longer points at a live workspace for this handoff.",
+        expected,
+        actual,
+        recoverySteps: [
+          "Return the handoff to implementation so the source issue can realize a live workspace again.",
+          `Rebind the issue with \`inheritExecutionWorkspaceFromIssueId=${provenance.sourceIssueId}\` after the workspace is restored.`,
+        ],
+      });
+    }
+
+    if (isArchivedExecutionWorkspace(currentSourceWorkspace)) {
+      return buildExecutionProvenanceReadiness({
+        code: "workspace_archived",
+        message: "The source implementation workspace is archived or no longer live.",
+        expected,
+        actual,
+        recoverySteps: [
+          "Return the handoff to implementation and restore or recreate the source workspace.",
+          `Rebind the issue with \`inheritExecutionWorkspaceFromIssueId=${provenance.sourceIssueId}\` after the workspace is live again.`,
+        ],
+      });
+    }
+
+    if (!capturedSourceWorkspace) {
+      return buildExecutionProvenanceReadiness({
+        code: "missing_source_workspace",
+        message: "The source implementation workspace for this handoff is missing.",
+        expected,
+        actual,
+        recoverySteps: [
+          "Return the handoff to implementation so the source issue can realize a live workspace again.",
+          `Rebind the issue with \`inheritExecutionWorkspaceFromIssueId=${provenance.sourceIssueId}\` after the workspace is restored.`,
+        ],
+      });
+    }
+
+    if (isArchivedExecutionWorkspace(capturedSourceWorkspace)) {
+      return buildExecutionProvenanceReadiness({
+        code: "workspace_archived",
+        message: "The source implementation workspace is archived or no longer live.",
+        expected,
+        actual,
+        recoverySteps: [
+          "Return the handoff to implementation and restore or recreate the source workspace.",
+          `Rebind the issue with \`inheritExecutionWorkspaceFromIssueId=${provenance.sourceIssueId}\` after the workspace is live again.`,
+        ],
+      });
+    }
+
+    if (sourceIssue.executionWorkspaceId !== provenance.sourceExecutionWorkspaceId) {
+      return buildExecutionProvenanceReadiness({
+        code: "workspace_mismatch",
+        message: "The source implementation issue moved to a different workspace after this handoff was captured.",
+        expected,
+        actual,
+        recoverySteps: [
+          "Return the handoff to implementation until the source issue settles on the workspace that should be reviewed.",
+          `Rebind the issue with \`inheritExecutionWorkspaceFromIssueId=${provenance.sourceIssueId}\` to restore the source workspace.`,
+        ],
+      });
+    }
+
+    if (!provenance.branchName || !provenance.baseRef) {
+      return buildExecutionProvenanceReadiness({
+        code: "missing_compare_target",
+        message: "This handoff is missing the branch or compare target required to review the code change.",
+        expected,
+        actual,
+        recoverySteps: [
+          "Set the source workspace branch and base ref before reassigning review, QA, or release.",
+          `Rebind the issue with \`inheritExecutionWorkspaceFromIssueId=${provenance.sourceIssueId}\` after the compare target is fixed.`,
+        ],
+      });
+    }
+
+    if (executionProvenanceCompareTargetDrifted(capturedSourceWorkspace, provenance)) {
+      return buildExecutionProvenanceReadiness({
+        code: "workspace_mismatch",
+        message: "The source implementation workspace compare target changed after this handoff was captured.",
+        expected,
+        actual,
+        recoverySteps: [
+          "Return the handoff to implementation until the source workspace branch and compare target settle again.",
+          `Rebind the issue with \`inheritExecutionWorkspaceFromIssueId=${provenance.sourceIssueId}\` after the compare target is fixed.`,
+        ],
+      });
+    }
+
+    if (issue.executionWorkspaceId !== provenance.sourceExecutionWorkspaceId) {
+      return buildExecutionProvenanceReadiness({
+        code: "workspace_mismatch",
+        message: "This issue is bound to a different workspace than the implementation it is supposed to judge.",
+        expected,
+        actual,
+        recoverySteps: [
+          `Rebind the issue with \`inheritExecutionWorkspaceFromIssueId=${provenance.sourceIssueId}\` to restore the source workspace.`,
+          "Do not continue review, QA, or release work in the current workspace until the handoff is corrected.",
+        ],
+      });
+    }
+
+    return buildExecutionProvenanceReadiness({
+      code: "ready",
+      message: "This handoff is bound to the expected implementation workspace and compare target.",
+      expected,
+      actual,
+      recoverySteps: [],
+    });
+  }
 
   async function getIssueByUuid(id: string) {
     const row = await db
@@ -2423,6 +2742,26 @@ export function issueService(db: Db) {
       return readiness.get(issueId) ?? createIssueDependencyReadiness(issueId);
     },
 
+    getExecutionProvenanceReadiness: async (issueId: string, dbOrTx: any = db) => {
+      const issue = await dbOrTx
+        .select({
+          companyId: issues.companyId,
+          executionWorkspaceId: issues.executionWorkspaceId,
+          executionProvenance: issues.executionProvenance,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((
+          rows: Array<{
+            companyId: string;
+            executionWorkspaceId: string | null;
+            executionProvenance: IssueExecutionProvenance | null;
+          }>,
+        ) => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+      return evaluateExecutionProvenanceReadinessForIssue(dbOrTx, issue);
+    },
+
     listDependencyReadiness: async (companyId: string, issueIds: string[], dbOrTx: any = db) => {
       return listIssueDependencyReadinessMap(dbOrTx, companyId, issueIds);
     },
@@ -2643,13 +2982,18 @@ export function issueService(db: Db) {
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
+        executionProvenance: requestedExecutionProvenanceRaw,
         ...issueData
       } = data;
+      const requestedExecutionProvenance = normalizeExecutionProvenanceInput(requestedExecutionProvenanceRaw);
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
         delete issueData.executionWorkspaceSettings;
+      }
+      if (requestedExecutionProvenance && !isolatedWorkspacesEnabled) {
+        throw unprocessable("Same-code-change handoffs require isolated workspaces to be enabled");
       }
       if (data.assigneeAgentId && data.assigneeUserId) {
         throw unprocessable("Issue can only have one assignee");
@@ -2669,6 +3013,7 @@ export function issueService(db: Db) {
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
         let executionWorkspaceId = issueData.executionWorkspaceId ?? null;
         let executionWorkspacePreference = issueData.executionWorkspacePreference ?? null;
+        let executionProvenance: IssueExecutionProvenance | null = null;
         let executionWorkspaceSettings =
           (issueData.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null;
         const workspaceInheritanceIssueId = inheritExecutionWorkspaceFromIssueId ?? issueData.parentId ?? null;
@@ -2703,6 +3048,16 @@ export function issueService(db: Db) {
               };
             }
           }
+        }
+        if (requestedExecutionProvenance) {
+          if (!workspaceInheritanceIssueId) {
+            throw unprocessable("Same-code-change handoffs require inheritExecutionWorkspaceFromIssueId or parentId");
+          }
+          executionProvenance = await captureExecutionProvenance(tx, {
+            companyId,
+            sourceIssueId: workspaceInheritanceIssueId,
+            handoffRole: requestedExecutionProvenance.handoffRole,
+          });
         }
         if (
           executionWorkspaceSettings == null &&
@@ -2747,6 +3102,21 @@ export function issueService(db: Db) {
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(companyId, issueData.projectId, executionWorkspaceId, tx);
         }
+        if (
+          executionProvenance &&
+          REVIEW_STYLE_PROVENANCE_ROLES.has(executionProvenance.handoffRole)
+        ) {
+          const readiness = await evaluateExecutionProvenanceReadinessForIssue(tx, {
+            companyId,
+            executionWorkspaceId,
+            executionProvenance,
+          });
+          if (readiness && !readiness.ready) {
+            throw unprocessable("Execution provenance handoff is not ready", {
+              executionProvenanceReadiness: readiness,
+            });
+          }
+        }
         // Self-correcting counter: use MAX(issue_number) + 1 if the counter
         // has drifted below the actual max, preventing identifier collisions.
         const [maxRow] = await tx
@@ -2776,6 +3146,7 @@ export function issueService(db: Db) {
             projectGoalId,
             defaultGoalId: defaultCompanyGoal?.id ?? null,
           }),
+          ...(executionProvenance ? { executionProvenance } : {}),
           ...(projectWorkspaceId ? { projectWorkspaceId } : {}),
           ...(executionWorkspaceId ? { executionWorkspaceId } : {}),
           ...(executionWorkspacePreference ? { executionWorkspacePreference } : {}),
@@ -2820,6 +3191,8 @@ export function issueService(db: Db) {
       data: Partial<typeof issues.$inferInsert> & {
         labelIds?: string[];
         blockedByIssueIds?: string[];
+        inheritExecutionWorkspaceFromIssueId?: string | null;
+        executionProvenance?: IssueExecutionProvenanceInput | null;
         actorAgentId?: string | null;
         actorUserId?: string | null;
       },
@@ -2835,15 +3208,21 @@ export function issueService(db: Db) {
       const {
         labelIds: nextLabelIds,
         blockedByIssueIds,
+        inheritExecutionWorkspaceFromIssueId,
+        executionProvenance: requestedExecutionProvenanceRaw,
         actorAgentId,
         actorUserId,
         ...issueData
       } = data;
+      const requestedExecutionProvenance = normalizeExecutionProvenanceInput(requestedExecutionProvenanceRaw);
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
         delete issueData.executionWorkspaceSettings;
+      }
+      if (requestedExecutionProvenance && !isolatedWorkspacesEnabled) {
+        throw unprocessable("Same-code-change handoffs require isolated workspaces to be enabled");
       }
 
       if (issueData.status) {
@@ -2886,15 +3265,114 @@ export function issueService(db: Db) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);
       }
       const nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;
-      const nextProjectWorkspaceId =
+      let nextProjectWorkspaceId =
         issueData.projectWorkspaceId !== undefined ? issueData.projectWorkspaceId : existing.projectWorkspaceId;
-      const nextExecutionWorkspaceId =
+      let nextExecutionWorkspaceId =
         issueData.executionWorkspaceId !== undefined ? issueData.executionWorkspaceId : existing.executionWorkspaceId;
+      let nextExecutionWorkspacePreference =
+        issueData.executionWorkspacePreference !== undefined
+          ? issueData.executionWorkspacePreference
+          : existing.executionWorkspacePreference;
+      let nextExecutionWorkspaceSettings =
+        issueData.executionWorkspaceSettings !== undefined
+          ? ((issueData.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null)
+          : ((existing.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? null);
+      let nextExecutionProvenance =
+        requestedExecutionProvenance === null
+          ? null
+          : (existing.executionProvenance as IssueExecutionProvenance | null | undefined) ?? null;
+      const hasExplicitExecutionWorkspaceOverride =
+        issueData.executionWorkspaceId !== undefined ||
+        issueData.executionWorkspacePreference !== undefined ||
+        issueData.executionWorkspaceSettings !== undefined;
+
+      const nextParentId = issueData.parentId !== undefined ? issueData.parentId : existing.parentId;
+      const provenanceSourceIssueId = inheritExecutionWorkspaceFromIssueId
+        ?? nextExecutionProvenance?.sourceIssueId
+        ?? nextParentId
+        ?? null;
+      const requestedHandoffRole = requestedExecutionProvenance?.handoffRole ?? nextExecutionProvenance?.handoffRole ?? null;
+
+      if (provenanceSourceIssueId) {
+        const workspaceSource = await getWorkspaceInheritanceIssue(dbOrTx, existing.companyId, provenanceSourceIssueId);
+        if (nextProjectWorkspaceId == null && workspaceSource.projectWorkspaceId) {
+          nextProjectWorkspaceId = workspaceSource.projectWorkspaceId;
+        }
+        if (
+          isolatedWorkspacesEnabled &&
+          !hasExplicitExecutionWorkspaceOverride &&
+          workspaceSource.executionWorkspaceId
+        ) {
+          const sourceWorkspace = await dbOrTx
+            .select({
+              id: executionWorkspaces.id,
+              mode: executionWorkspaces.mode,
+            })
+            .from(executionWorkspaces)
+            .where(eq(executionWorkspaces.id, workspaceSource.executionWorkspaceId))
+            .then((rows: Array<{ id: string; mode: string }>) => rows[0] ?? null);
+          if (sourceWorkspace) {
+            nextExecutionWorkspaceId = sourceWorkspace.id;
+            nextExecutionWorkspacePreference = "reuse_existing";
+            nextExecutionWorkspaceSettings = {
+              ...((workspaceSource.executionWorkspaceSettings as Record<string, unknown> | null | undefined) ?? {}),
+              mode: issueExecutionWorkspaceModeForPersistedWorkspace(sourceWorkspace.mode),
+            };
+          }
+        }
+      }
+
+      if (requestedExecutionProvenance) {
+        if (!provenanceSourceIssueId || !requestedHandoffRole) {
+          throw unprocessable("Same-code-change handoffs require inheritExecutionWorkspaceFromIssueId or parentId");
+        }
+        nextExecutionProvenance = await captureExecutionProvenance(dbOrTx, {
+          companyId: existing.companyId,
+          sourceIssueId: provenanceSourceIssueId,
+          handoffRole: requestedHandoffRole,
+        });
+      } else if (inheritExecutionWorkspaceFromIssueId && nextExecutionProvenance && requestedHandoffRole) {
+        nextExecutionProvenance = await captureExecutionProvenance(dbOrTx, {
+          companyId: existing.companyId,
+          sourceIssueId: inheritExecutionWorkspaceFromIssueId,
+          handoffRole: requestedHandoffRole,
+        });
+      }
       if (nextProjectWorkspaceId) {
         await assertValidProjectWorkspace(existing.companyId, nextProjectId, nextProjectWorkspaceId);
       }
       if (nextExecutionWorkspaceId) {
         await assertValidExecutionWorkspace(existing.companyId, nextProjectId, nextExecutionWorkspaceId);
+      }
+      const provenanceBindingChanged =
+        requestedExecutionProvenance !== undefined
+        || inheritExecutionWorkspaceFromIssueId !== undefined
+        || issueData.executionWorkspaceId !== undefined
+        || issueData.executionWorkspacePreference !== undefined
+        || issueData.executionWorkspaceSettings !== undefined;
+      if (
+        provenanceBindingChanged &&
+        nextExecutionProvenance &&
+        REVIEW_STYLE_PROVENANCE_ROLES.has(nextExecutionProvenance.handoffRole)
+      ) {
+        const readiness = await evaluateExecutionProvenanceReadinessForIssue(dbOrTx, {
+          companyId: existing.companyId,
+          executionWorkspaceId: nextExecutionWorkspaceId,
+          executionProvenance: nextExecutionProvenance,
+        });
+        if (readiness && !readiness.ready) {
+          throw unprocessable("Execution provenance handoff is not ready", {
+            executionProvenanceReadiness: readiness,
+          });
+        }
+      }
+
+      patch.projectWorkspaceId = nextProjectWorkspaceId;
+      patch.executionWorkspaceId = nextExecutionWorkspaceId;
+      patch.executionWorkspacePreference = nextExecutionWorkspacePreference;
+      patch.executionWorkspaceSettings = nextExecutionWorkspaceSettings;
+      if (requestedExecutionProvenance !== undefined || inheritExecutionWorkspaceFromIssueId) {
+        patch.executionProvenance = nextExecutionProvenance;
       }
 
       applyStatusSideEffects(issueData.status, patch);

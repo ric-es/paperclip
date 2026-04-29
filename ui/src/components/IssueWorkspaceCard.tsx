@@ -175,6 +175,9 @@ interface IssueWorkspaceCardProps {
     "companyId"
   > & {
     companyId: string | null;
+    identifier?: string | null;
+    executionProvenance?: Issue["executionProvenance"];
+    executionProvenanceReadiness?: Issue["executionProvenanceReadiness"];
     currentExecutionWorkspace?: ExecutionWorkspace | null;
   };
   project: {
@@ -261,6 +264,16 @@ export function IssueWorkspaceCard({
         ?? issue.executionWorkspaceSettings?.mode
         ?? defaultExecutionWorkspaceModeForProject(project)
       );
+  const executionProvenance = issue.executionProvenance ?? null;
+  const executionProvenanceReadiness = issue.executionProvenanceReadiness ?? null;
+  const executionProvenanceExpected = executionProvenanceReadiness?.expected ?? null;
+  const executionProvenanceSourceRef =
+    executionProvenanceExpected?.sourceIssueIdentifier
+    ?? executionProvenance?.sourceIssueId
+    ?? null;
+  const executionProvenanceRoleLabel = executionProvenance
+    ? executionProvenance.handoffRole.replace(/_/g, " ")
+    : null;
 
   const [draftSelection, setDraftSelection] = useState(currentSelection);
   const [draftExecutionWorkspaceId, setDraftExecutionWorkspaceId] = useState(issue.executionWorkspaceId ?? "");
@@ -467,6 +480,20 @@ export function IssueWorkspaceCard({
               )}
             </div>
           )}
+          {executionProvenance && currentSelection === "reuse_existing" && executionProvenanceSourceRef ? (
+            <div className="text-muted-foreground" style={{ overflowWrap: "anywhere" }}>
+              Same code change:{" "}
+              <span className="text-foreground">
+                {executionProvenanceRoleLabel ? `${executionProvenanceRoleLabel} handoff from ` : ""}
+                {executionProvenanceSourceRef}
+              </span>
+              {executionProvenanceReadiness
+                ? executionProvenanceReadiness.ready
+                  ? " · ready"
+                  : ` · ${executionProvenanceReadiness.code.replace(/_/g, " ")}`
+                : null}
+            </div>
+          ) : null}
           {workspace && currentWorkspaceLink && (
             <div className="pt-0.5">
               <Link
@@ -576,6 +603,11 @@ export function IssueWorkspaceCard({
                 {" · "}
                 {workspace.status}
               </div>
+              {executionProvenance && draftSelection === "reuse_existing" && executionProvenanceSourceRef ? (
+                <div style={{ overflowWrap: "anywhere" }}>
+                  This workspace is tied to the same code change as {executionProvenanceSourceRef}.
+                </div>
+              ) : null}
             </div>
           )}
         </div>

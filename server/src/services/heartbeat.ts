@@ -3208,6 +3208,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
+    const wakeReason = readNonEmptyString(contextSnapshot.wakeReason);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) {
       if (run.issueCommentStatus !== "not_applicable") {
@@ -3228,6 +3229,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         issueCommentRetryQueuedAt: null,
       });
       return { outcome: "satisfied" as const, queuedRun: null };
+    }
+
+    if (wakeReason === "issue_commented" || wakeReason === "issue_comment_mentioned") {
+      await patchRunIssueCommentStatus(run.id, {
+        issueCommentStatus: "not_applicable",
+        issueCommentSatisfiedByCommentId: null,
+        issueCommentRetryQueuedAt: null,
+      });
+      return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
     if (readNonEmptyString(contextSnapshot.retryReason) === "missing_issue_comment") {

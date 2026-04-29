@@ -870,6 +870,7 @@ export {
   type ListPluginState,
   pilotApplicationSchema,
   PILOT_PRACTICE_TYPES,
+  PILOT_CAP,
   type PilotApplication,
   type PilotPracticeType,
 } from "./validators/index.js";

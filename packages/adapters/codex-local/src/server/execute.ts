@@ -444,6 +444,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   if (runtimePrimaryUrl) {
     env.PAPERCLIP_RUNTIME_PRIMARY_URL = runtimePrimaryUrl;
+    if (!executionTargetIsRemote) {
+      env.PAPERCLIP_API_URL = runtimePrimaryUrl;
+    }
   }
   const targetPaperclipApiUrl = adapterExecutionTargetPaperclipApiUrl(executionTarget);
   if (targetPaperclipApiUrl) {

@@ -71,7 +71,4 @@ ENV NODE_ENV=production \
 #VOLUME ["/paperclip"]
 EXPOSE 3100
 
-RUN mkdir -p /paperclip/instances/default && echo '{"$meta":{"version":1},"server":{"deploymentMode":"public","exposure":"public","bind":"all","host":"0.0.0.0","port":3100,"allowedHostnames":[],"serveUi":true},"auth":{"baseUrlMode":"auto","disableSignUp":false},"telemetry":{"enabled":true}}' > /paperclip/instances/default/config.json && chown -R node:node /paperclip
-
-ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
+RUN mkdir -p /paperclip/instances/default && echo '{"$meta":{"version":1,"updatedAt":"2026-05-06T00:00:00.000Z","source":"docker"},"database":{"mode":"embedded-postgres","embeddedPostgresDataDir":"/paperclip/instances/default/db","embeddedPostgresPort":54329,"backup":{"enabled":true,"intervalMinutes":60,"retentionDays":30,"dir":"/paperclip/instances/default/data/backups"}},"logging":{"mode":"file","logDir":"/paperclip/instances/default/logs"},"server":{"deploymentMode":"authenticated","exposure":"public","bind":"lan","host":"0.0.0.0","port":3100,"allowedHostnames":["paperclip-production-f663.up.railway.app"],"serveUi":true},"auth":{"baseUrlMode":"explicit","disableSignUp":false},"telemetry":{"enabled":true},"storage":{"provider":"local_disk","localDisk":{"baseDir":"/paperclip/instances/default/data/storage"}},"secrets":{"provider":"local_encrypted","strictMode":false,"localEncrypted":{"keyFilePath":"/paperclip/instances/default/secrets/master.key"}}}' > /paperclip/instances/default/config.json && chown -R node:node /paperclip

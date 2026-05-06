@@ -71,5 +71,7 @@ ENV NODE_ENV=production \
 #VOLUME ["/paperclip"]
 EXPOSE 3100
 
+RUN mkdir -p /paperclip/instances/default && echo '{"$meta":{"version":1},"server":{"deploymentMode":"public","exposure":"public","bind":"all","host":"0.0.0.0","port":3100,"allowedHostnames":[],"serveUi":true},"auth":{"baseUrlMode":"auto","disableSignUp":false},"telemetry":{"enabled":true}}' > /paperclip/instances/default/config.json && chown -R node:node /paperclip
+
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
